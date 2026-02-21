@@ -52,7 +52,7 @@ npm run watch    # tsc -w (dev mode)
 ```bash
 npm run build && npm pack --pack-destination .
 scp homebridge-dreo-*.tgz pi@192.168.1.222:/tmp/
-ssh pi@192.168.1.222 "sudo npm install -g /tmp/homebridge-dreo-*.tgz && sudo systemctl restart homebridge"
+ssh pi@192.168.1.222 "cd /var/lib/homebridge && sudo npm install /tmp/homebridge-dreo-*.tgz && sudo systemctl restart homebridge"
 ```
 
 ## Syncing with Upstream
