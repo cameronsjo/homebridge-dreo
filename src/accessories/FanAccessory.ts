@@ -347,9 +347,18 @@ export class FanAccessory extends BaseAccessory {
     // Avoid setting speed to 0 (illegal value)
     if (converted !== 0) {
       this.platform.log.debug('Setting fan speed:', converted);
-      // Setting power state to true ensures the fan is actually on
+      if (!this.currState.on) {
+        // Some Dreo devices ignore windlevel when it's sent in the same packet
+        // as the power-on command, so power on first and wait for it to apply
+        // before sending the speed command
+        this.platform.log.debug('Fan is off, powering on before setting speed');
+        this.platform.webHelper.control(this.sn, {
+          [this.currState.powerCMD]: true,
+        });
+        this.currState.on = true;
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
       this.platform.webHelper.control(this.sn, {
-        [this.currState.powerCMD]: true,
         windlevel: converted,
       });
     }
