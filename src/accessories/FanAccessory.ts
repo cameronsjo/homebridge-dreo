@@ -12,6 +12,10 @@ export class FanAccessory extends BaseAccessory {
   private temperatureService?: Service;
   private lightService?: Service;
 
+  // In-flight power-on transition; concurrent speed requests await the same
+  // delay so none of them sends windlevel while the fan is still powering on
+  private powerOnTransition: Promise<void> | null = null;
+
   // Cached copy of latest fan states
   private currState = {
     on: false,
@@ -347,9 +351,23 @@ export class FanAccessory extends BaseAccessory {
     // Avoid setting speed to 0 (illegal value)
     if (converted !== 0) {
       this.platform.log.debug('Setting fan speed:', converted);
-      // Setting power state to true ensures the fan is actually on
+      if (!this.currState.on && this.powerOnTransition === null) {
+        // Some Dreo devices ignore windlevel when it's sent in the same packet
+        // as the power-on command, so power on first and wait for it to apply
+        // before sending the speed command. currState.on is updated by the
+        // device's websocket report rather than optimistically here.
+        this.platform.log.debug('Fan is off, powering on before setting speed');
+        this.platform.webHelper.control(this.sn, {
+          [this.currState.powerCMD]: true,
+        });
+        this.powerOnTransition = new Promise<void>((resolve) => setTimeout(resolve, 500)).finally(() => {
+          this.powerOnTransition = null;
+        });
+      }
+      if (this.powerOnTransition) {
+        await this.powerOnTransition;
+      }
       this.platform.webHelper.control(this.sn, {
-        [this.currState.powerCMD]: true,
         windlevel: converted,
       });
     }
