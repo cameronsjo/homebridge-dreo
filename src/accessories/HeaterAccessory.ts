@@ -195,14 +195,27 @@ export class HeaterAccessory extends BaseAccessory {
 
     // Update values from Dreo app
     platform.webHelper.addEventListener('message', message => {
-      const data = JSON.parse(message.data);
+      // The socket payload is untrusted input; an unguarded parse throws inside
+      // the listener, where nothing catches it
+      let data;
+      try {
+        data = JSON.parse(message.data);
+      } catch (error) {
+        platform.log.error(
+          'Failed to parse incoming WebSocket message, discarding it. Payload: %s, Error: %s',
+          message.data,
+          error,
+        );
+        return;
+      }
 
       // Check if message applies to this device
       if (data.devicesn === accessory.context.device.sn) {
         platform.log.debug('Incoming %s', message.data);
 
         // Check if we need to update fan state in homekit
-        if (data.method === 'control-report' || data.method === 'control-reply' || data.method === 'report') {
+        if ((data.method === 'control-report' || data.method === 'control-reply' || data.method === 'report')
+          && data.reported) {
           Object.keys(data.reported).forEach(key => {
             switch(key) {
               case 'poweron':
