@@ -2,6 +2,11 @@ import { Service, PlatformAccessory } from 'homebridge';
 import { DreoPlatform } from '../platform';
 import { BaseAccessory } from './BaseAccessory';
 
+// Fallback ceiling for a power-on confirmation. Measured round trips on a
+// healthy socket are 32-44ms, so this only expires when something is wrong;
+// it is a backstop, not the expected path.
+const POWER_ON_CONFIRM_TIMEOUT_MS = 1000;
+
 /**
  * Platform Accessory
  * An instance of this class is created for each accessory your platform registers
@@ -13,8 +18,12 @@ export class FanAccessory extends BaseAccessory {
   private lightService?: Service;
 
   // In-flight power-on transition; concurrent speed requests await the same
-  // delay so none of them sends windlevel while the fan is still powering on
+  // transition so none of them sends windlevel while the fan is still powering on
   private powerOnTransition: Promise<void> | null = null;
+
+  // Retires the in-flight transition above. Held on the instance because the
+  // device's confirmation arrives in the WebSocket message handler, not here.
+  private resolvePowerOn: (() => void) | null = null;
 
   // Cached copy of latest fan states
   private currState = {
@@ -221,6 +230,9 @@ export class FanAccessory extends BaseAccessory {
                   .getCharacteristic(this.platform.Characteristic.Active)
                   .updateValue(this.currState.on);
                 this.platform.log.debug('Fan power:', data.reported.poweron);
+                if (this.currState.on) {
+                  this.confirmPowerOn();
+                }
                 break;
               case 'fanon':
                 this.currState.on = data.reported.fanon;
@@ -228,6 +240,9 @@ export class FanAccessory extends BaseAccessory {
                   .getCharacteristic(this.platform.Characteristic.Active)
                   .updateValue(this.currState.on);
                 this.platform.log.debug('Fan power:', data.reported.fanon);
+                if (this.currState.on) {
+                  this.confirmPowerOn();
+                }
                 break;
               case 'windlevel':
                 this.currState.speed =
@@ -366,16 +381,14 @@ export class FanAccessory extends BaseAccessory {
       this.platform.log.debug('Setting fan speed:', converted);
       if (!this.currState.on && this.powerOnTransition === null) {
         // Some Dreo devices ignore windlevel when it's sent in the same packet
-        // as the power-on command, so power on first and wait for it to apply
-        // before sending the speed command. currState.on is updated by the
-        // device's websocket report rather than optimistically here.
+        // as the power-on command, so power on first and wait for the device to
+        // confirm before sending the speed command. currState.on is updated by
+        // the device's websocket report rather than optimistically here.
         this.platform.log.debug('Fan is off, powering on before setting speed');
         this.platform.webHelper.control(this.sn, {
           [this.currState.powerCMD]: true,
         });
-        this.powerOnTransition = new Promise<void>((resolve) => setTimeout(resolve, 500)).finally(() => {
-          this.powerOnTransition = null;
-        });
+        this.powerOnTransition = this.awaitPowerOnConfirmation();
       }
       if (this.powerOnTransition) {
         await this.powerOnTransition;
@@ -384,6 +397,34 @@ export class FanAccessory extends BaseAccessory {
         windlevel: converted,
       });
     }
+  }
+
+  // Resolve once the device reports that it is on, rather than after a fixed
+  // delay. A fixed delay is either dead time or too short, and when it is too
+  // short the speed command lands while the fan is still off and is discarded.
+  private awaitPowerOnConfirmation(): Promise<void> {
+    const transition = new Promise<void>((resolve) => {
+      this.resolvePowerOn = resolve;
+    });
+    // The executor above runs synchronously, so resolvePowerOn is set by here
+    const timeout = setTimeout(() => {
+      this.platform.log.warn(
+        'Timed out waiting for the fan to confirm power-on, sending speed anyway. Timeout: %dms',
+        POWER_ON_CONFIRM_TIMEOUT_MS,
+      );
+      this.resolvePowerOn?.();
+    }, POWER_ON_CONFIRM_TIMEOUT_MS);
+
+    return transition.finally(() => {
+      clearTimeout(timeout);
+      this.resolvePowerOn = null;
+      this.powerOnTransition = null;
+    });
+  }
+
+  // Called from the WebSocket message handler when the device reports power on
+  private confirmPowerOn() {
+    this.resolvePowerOn?.();
   }
 
   async getRotationSpeed() {
