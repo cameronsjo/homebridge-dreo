@@ -155,6 +155,17 @@ export default class DreoAPI {
 
   // Send control commands to device (fan speed, power, etc)
   public control(sn, command) {
+    // ReconnectingWebSocket queues sends made while the socket is down and
+    // flushes them on reconnect, with no signal that it did so. A degraded
+    // socket therefore looks like a slow device rather than a lost connection.
+    // The send still goes through — this only makes the buffering visible.
+    if (this.ws.readyState !== WebSocket.OPEN) {
+      this.log.warn(
+        'Sending control command while WebSocket is not open, it will be buffered until reconnect. ReadyState: %s, Command: %s',
+        this.ws.readyState,
+        JSON.stringify(command),
+      );
+    }
     this.ws.send(JSON.stringify({
       'deviceSn': sn,
       'method': 'control',
