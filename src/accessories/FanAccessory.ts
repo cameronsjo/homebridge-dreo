@@ -7,6 +7,12 @@ import { BaseAccessory } from './BaseAccessory';
 // it is a backstop, not the expected path.
 const POWER_ON_CONFIRM_TIMEOUT_MS = 1000;
 
+// How long to let commands settle before re-reading authoritative state. Long
+// enough for the device to actually apply and report a change (observed at
+// roughly 300-500ms, worst case 1.3s), and debounced so a burst of commands
+// costs one REST call rather than one per command.
+const STATE_RECONCILE_DELAY_MS = 3000;
+
 /**
  * Platform Accessory
  * An instance of this class is created for each accessory your platform registers
@@ -24,6 +30,9 @@ export class FanAccessory extends BaseAccessory {
   // Retires the in-flight transition above. Held on the instance because the
   // device's confirmation arrives in the WebSocket message handler, not here.
   private resolvePowerOn: (() => void) | null = null;
+
+  // Debounce handle for the post-command reconciliation read
+  private reconcileTimer?: NodeJS.Timeout;
 
   // Cached copy of latest fan states
   private currState = {
@@ -358,13 +367,16 @@ export class FanAccessory extends BaseAccessory {
   // Handle requests to set the "Active" characteristic
   setActive(value) {
     this.platform.log.debug('Triggered SET Active:', value);
-    // Check state to prevent duplicate requests
-    if (this.currState.on !== Boolean(value)) {
-      // Send to Dreo server via websocket
-      this.platform.webHelper.control(this.sn, {
-        [this.currState.powerCMD]: Boolean(value),
-      });
-    }
+    // Always send, even when the cached state already matches the request.
+    // The cache is only as good as the last report the device sent, and Dreo
+    // acknowledges a command before the hardware has necessarily complied — so
+    // a cache that has drifted would silently swallow the command here, with no
+    // send and no error. A redundant power command is harmless; a dropped one
+    // breaks the automation that issued it.
+    this.platform.webHelper.control(this.sn, {
+      [this.currState.powerCMD]: Boolean(value),
+    });
+    this.scheduleStateReconciliation();
   }
 
   // Handle requests to get the current value of the "Active" characteristic
@@ -396,6 +408,65 @@ export class FanAccessory extends BaseAccessory {
       this.platform.webHelper.control(this.sn, {
         windlevel: converted,
       });
+      this.scheduleStateReconciliation();
+    }
+  }
+
+  // Dreo answers a command with control-reply, which only echoes back the value
+  // that was requested; it is not proof the hardware complied. Re-read the
+  // authoritative REST state once the dust settles and push that instead.
+  //
+  // Debounced so a slider drag, or an automation firing several commands at
+  // once, costs a single read rather than one per command.
+  private scheduleStateReconciliation() {
+    if (this.reconcileTimer) {
+      clearTimeout(this.reconcileTimer);
+    }
+    this.reconcileTimer = setTimeout(
+      () => this.reconcileState(),
+      STATE_RECONCILE_DELAY_MS,
+    );
+  }
+
+  private async reconcileState() {
+    const state = await this.platform.webHelper.getState(this.sn);
+    if (state === undefined) {
+      this.platform.log.warn(
+        'Could not re-read device state to reconcile, HomeKit may be showing a stale value. Device: %s',
+        this.accessory.context.device.deviceName,
+      );
+      return;
+    }
+
+    // Power and speed only: these are the values automations act on, and the
+    // ones observed to drift when the device ignores a command
+    const powerState = state[this.currState.powerCMD]?.state;
+    if (powerState !== undefined && powerState !== this.currState.on) {
+      this.platform.log.info(
+        'Reconciled fan power against the Dreo API. Cached: %s, Actual: %s',
+        this.currState.on,
+        powerState,
+      );
+      this.currState.on = powerState;
+      this.service
+        .getCharacteristic(this.platform.Characteristic.Active)
+        .updateValue(this.currState.on);
+    }
+
+    const windlevel = state.windlevel?.state;
+    if (windlevel !== undefined) {
+      const speed = (windlevel * 100) / this.currState.maxSpeed;
+      if (speed !== this.currState.speed) {
+        this.platform.log.info(
+          'Reconciled fan speed against the Dreo API. Cached: %s, Actual: %s',
+          this.currState.speed,
+          speed,
+        );
+        this.currState.speed = speed;
+        this.service
+          .getCharacteristic(this.platform.Characteristic.RotationSpeed)
+          .updateValue(this.currState.speed);
+      }
     }
   }
 
