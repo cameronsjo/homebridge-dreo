@@ -352,6 +352,22 @@ export class FanAccessory extends BaseAccessory {
                   data.reported.brightness,
                 );
                 break;
+              case 'error_code':
+                // Dreo answers a rejected command with an error frame rather
+                // than a state change, and still emits a normal-looking reply
+                // echoing the requested value. Without this case the rejection
+                // falls through to the unknown-key branch below and is logged
+                // at debug, so HomeKit keeps whatever the echo implied.
+                this.platform.log.error(
+                  'Dreo rejected a control command, the device state did not change. Code: %s, Message: %s',
+                  data.reported.error_code,
+                  data.reported.error_msg,
+                );
+                this.scheduleStateReconciliation();
+                break;
+              case 'error_msg':
+                // Always accompanies error_code, which carries the log above
+                break;
               default:
                 platform.log.debug(
                   'Unknown command received:',
@@ -440,13 +456,20 @@ export class FanAccessory extends BaseAccessory {
 
     // Power and speed only: these are the values automations act on, and the
     // ones observed to drift when the device ignores a command
+    // Push unconditionally rather than only when our own cache disagrees.
+    // HomeKit keeps its own copy of every characteristic, and it can be stale
+    // even when ours is correct — in which case an automation whose target
+    // state HomeKit believes is already met may never send a command at all.
+    // The comparison below gates the log line, not the push.
     const powerState = state[this.currState.powerCMD]?.state;
-    if (powerState !== undefined && powerState !== this.currState.on) {
-      this.platform.log.info(
-        'Reconciled fan power against the Dreo API. Cached: %s, Actual: %s',
-        this.currState.on,
-        powerState,
-      );
+    if (powerState !== undefined) {
+      if (powerState !== this.currState.on) {
+        this.platform.log.info(
+          'Reconciled fan power against the Dreo API. Cached: %s, Actual: %s',
+          this.currState.on,
+          powerState,
+        );
+      }
       this.currState.on = powerState;
       this.service
         .getCharacteristic(this.platform.Characteristic.Active)
@@ -462,11 +485,11 @@ export class FanAccessory extends BaseAccessory {
           this.currState.speed,
           speed,
         );
-        this.currState.speed = speed;
-        this.service
-          .getCharacteristic(this.platform.Characteristic.RotationSpeed)
-          .updateValue(this.currState.speed);
       }
+      this.currState.speed = speed;
+      this.service
+        .getCharacteristic(this.platform.Characteristic.RotationSpeed)
+        .updateValue(this.currState.speed);
     }
   }
 
