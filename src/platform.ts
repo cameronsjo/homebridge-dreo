@@ -143,8 +143,10 @@ export class DreoPlatform implements DynamicPlatformPlugin {
       // Get initial device state
       const state = await this.webHelper.getState(device.sn);
       if (state === undefined) {
-        this.log.error('error: Failed to retrieve device state');
-        return;
+        // Skip this device rather than abandoning the loop — one unreachable
+        // device must not stop every later device from being registered
+        this.log.error('Failed to retrieve device state, skipping device. Device: %s', device.deviceName);
+        continue;
       }
       this.log.debug('Accessory state:', state);
 
