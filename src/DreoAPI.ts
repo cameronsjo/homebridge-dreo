@@ -129,16 +129,19 @@ export default class DreoAPI {
       [],
       {WebSocket: WebSocket});
 
+    // Lifecycle events are logged at info/error rather than debug: this socket is
+    // the only path to the device, so a drop must be visible without running the
+    // whole Homebridge instance under -D
     this.ws.addEventListener('error', error => {
-      this.log.debug('WebSocket', error);
+      this.log.error('WebSocket error. Server: %s, Error: %s', this.server, error.message ?? error);
     });
 
     this.ws.addEventListener('open', () => {
-      this.log.debug('WebSocket Opened');
+      this.log.info('WebSocket connection opened. Server: %s', this.server);
     });
 
     this.ws.addEventListener('close', () => {
-      this.log.debug('WebSocket Closed');
+      this.log.info('WebSocket connection closed, reconnect will be attempted. Server: %s', this.server);
     });
 
     // Keep connection open by sending empty packet every 15 seconds
