@@ -5,6 +5,17 @@ import WebSocket from 'ws';
 import type { DreoPlatform } from './platform';
 import type { Logger } from 'homebridge';
 
+// Homebridge's logger formats with util.format, which inspects an object
+// argument deeply enough to print request headers. An AxiosError carries
+// config.headers.authorization, so logging one verbatim writes the account
+// Bearer token into a log that gets tailed and pasted into issue reports.
+// Reduce every API failure to its message and status before it reaches the log.
+function describeApiError(error): string {
+  const status = error?.response?.status;
+  const message = error?.message ?? String(error);
+  return status === undefined ? message : `${message} (HTTP ${status})`;
+}
+
 // User agent string for API requests
 const ua = 'dreo/2.8.1 (iPhone; iOS 18.0.0; Scale/3.00)';
 
@@ -61,7 +72,7 @@ export default class DreoAPI {
         }
       })
       .catch((error) => {
-        this.log.error('error retrieving token:', error);
+        this.log.error('error retrieving token:', describeApiError(error));
         auth = undefined;
       });
     return auth;
@@ -87,7 +98,7 @@ export default class DreoAPI {
         devices = response.data.data.list;
       })
       .catch((error) => {
-        this.log.error('error retrieving device list:', error);
+        this.log.error('error retrieving device list:', describeApiError(error));
         devices = undefined;
       });
     return devices;
@@ -113,7 +124,10 @@ export default class DreoAPI {
         state = response.data.data.mixed;
       })
       .catch((error) => {
-        this.log.error('error retrieving device state:', error);
+        this.log.error(
+          'error retrieving device state:',
+          describeApiError(error),
+        );
         state = undefined;
       });
     return state;
@@ -133,7 +147,10 @@ export default class DreoAPI {
     // the only path to the device, so a drop must be visible without running the
     // whole Homebridge instance under -D
     this.ws.addEventListener('error', error => {
-      this.log.error('WebSocket error. Server: %s, Error: %s', this.server, error.message ?? error);
+      // Stringify defensively: the socket URL carries the access token as a
+      // query param, and the ErrorEvent's target holds that URL — never hand
+      // the event object itself to the logger
+      this.log.error('WebSocket error. Server: %s, Error: %s', this.server, String(error?.message ?? 'unknown'));
     });
 
     this.ws.addEventListener('open', () => {

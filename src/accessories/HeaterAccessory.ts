@@ -201,10 +201,13 @@ export class HeaterAccessory extends BaseAccessory {
       try {
         data = JSON.parse(message.data);
       } catch (error) {
+        // Size and reason only, never the payload: frames carry the device
+        // serial that platform.ts masks elsewhere, the socket accepts very
+        // large frames, and every accessory listens on the same socket
         platform.log.error(
-          'Failed to parse incoming WebSocket message, discarding it. Payload: %s, Error: %s',
-          message.data,
-          error,
+          'Failed to parse incoming WebSocket message, discarding it. Bytes: %s, Error: %s',
+          String(message.data).length,
+          error instanceof Error ? error.message : String(error),
         );
         return;
       }

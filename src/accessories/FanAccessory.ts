@@ -13,6 +13,22 @@ const POWER_ON_CONFIRM_TIMEOUT_MS = 1000;
 // costs one REST call rather than one per command.
 const STATE_RECONCILE_DELAY_MS = 3000;
 
+// Cap for any remote-supplied value that reaches the log. The socket accepts
+// very large frames and every accessory listens on the same one, so an
+// unbounded log of remote content is both a disk-fill risk and, via embedded
+// newlines, a way to forge log lines.
+const MAX_LOGGED_REMOTE_CHARS = 200;
+
+function forLog(value: unknown): string {
+  const text = String(value).slice(0, MAX_LOGGED_REMOTE_CHARS);
+  let sanitized = '';
+  for (const character of text) {
+    const code = character.charCodeAt(0);
+    sanitized += code < 0x20 || code === 0x7f ? ' ' : character;
+  }
+  return sanitized;
+}
+
 /**
  * Platform Accessory
  * An instance of this class is created for each accessory your platform registers
@@ -33,6 +49,10 @@ export class FanAccessory extends BaseAccessory {
 
   // Debounce handle for the post-command reconciliation read
   private reconcileTimer?: NodeJS.Timeout;
+
+  // Incremented on every scheduled reconcile so an in-flight read that resolves
+  // after a newer command can detect that it is stale and discard its result
+  private reconcileGeneration = 0;
 
   // Cached copy of latest fan states
   private currState = {
@@ -212,10 +232,14 @@ export class FanAccessory extends BaseAccessory {
       try {
         data = JSON.parse(message.data);
       } catch (error) {
+        // Log the size and the reason, never the payload: frames carry the
+        // device serial (which platform.ts masks elsewhere), the socket accepts
+        // up to 100 MiB per frame, and every accessory listens on the same
+        // socket, so echoing a bad frame multiplies into the log
         platform.log.error(
-          'Failed to parse incoming WebSocket message, discarding it. Payload: %s, Error: %s',
-          message.data,
-          error,
+          'Failed to parse incoming WebSocket message, discarding it. Bytes: %s, Error: %s',
+          String(message.data).length,
+          error instanceof Error ? error.message : String(error),
         );
         return;
       }
@@ -224,12 +248,16 @@ export class FanAccessory extends BaseAccessory {
       if (data.devicesn === accessory.context.device.sn) {
         platform.log.debug('Incoming %s', message.data);
 
+        // A control-reply only echoes the value that was requested; it is not
+        // evidence the hardware complied. Only the device's own report is.
+        const isDeviceReport =
+          data.method === 'control-report' || data.method === 'report';
+
         // Check if we need to update fan state in homekit
         if (
-          (data.method === 'control-report' ||
-            data.method === 'control-reply' ||
-            data.method === 'report') &&
-          data.reported
+          (isDeviceReport || data.method === 'control-reply') &&
+          typeof data.reported === 'object' &&
+          data.reported !== null
         ) {
           Object.keys(data.reported).forEach((key) => {
             switch (key) {
@@ -239,7 +267,7 @@ export class FanAccessory extends BaseAccessory {
                   .getCharacteristic(this.platform.Characteristic.Active)
                   .updateValue(this.currState.on);
                 this.platform.log.debug('Fan power:', data.reported.poweron);
-                if (this.currState.on) {
+                if (this.currState.on && isDeviceReport) {
                   this.confirmPowerOn();
                 }
                 break;
@@ -249,7 +277,7 @@ export class FanAccessory extends BaseAccessory {
                   .getCharacteristic(this.platform.Characteristic.Active)
                   .updateValue(this.currState.on);
                 this.platform.log.debug('Fan power:', data.reported.fanon);
-                if (this.currState.on) {
+                if (this.currState.on && isDeviceReport) {
                   this.confirmPowerOn();
                 }
                 break;
@@ -358,21 +386,29 @@ export class FanAccessory extends BaseAccessory {
                 // echoing the requested value. Without this case the rejection
                 // falls through to the unknown-key branch below and is logged
                 // at debug, so HomeKit keeps whatever the echo implied.
-                this.platform.log.error(
-                  'Dreo rejected a control command, the device state did not change. Code: %s, Message: %s',
-                  data.reported.error_code,
-                  data.reported.error_msg,
-                );
-                this.scheduleStateReconciliation();
+                // Guarded on a truthy code so a success-shaped error_code: 0
+                // would not log at error and trigger a needless REST read.
+                if (data.reported.error_code) {
+                  this.platform.log.error(
+                    'Dreo rejected a control command, the device state did not change. Code: %s, Message: %s',
+                    forLog(data.reported.error_code),
+                    forLog(data.reported.error_msg),
+                  );
+                  this.scheduleStateReconciliation();
+                }
                 break;
               case 'error_msg':
-                // Always accompanies error_code, which carries the log above
+                // Normally accompanies error_code, which carries the log above;
+                // on its own it would otherwise vanish silently
+                if (data.reported.error_code === undefined) {
+                  this.platform.log.warn(
+                    'Dreo reported an error with no code. Message: %s',
+                    forLog(data.reported.error_msg),
+                  );
+                }
                 break;
               default:
-                platform.log.debug(
-                  'Unknown command received:',
-                  Object.keys(data.reported)[0],
-                );
+                platform.log.debug('Unknown command received:', key);
             }
           });
         }
@@ -438,15 +474,43 @@ export class FanAccessory extends BaseAccessory {
     if (this.reconcileTimer) {
       clearTimeout(this.reconcileTimer);
     }
+    // Clearing the timer cannot cancel a read that has already been dispatched,
+    // so bump a generation counter too — a read that resolves after a newer
+    // command arrived is stale and must not be written back
+    this.reconcileGeneration += 1;
     this.reconcileTimer = setTimeout(
-      () => this.reconcileState(),
+      () => this.reconcileState(this.reconcileGeneration),
       STATE_RECONCILE_DELAY_MS,
     );
+    // Do not hold the event loop open for a pending reconcile during shutdown
+    this.reconcileTimer.unref?.();
   }
 
-  private async reconcileState() {
-    const state = await this.platform.webHelper.getState(this.sn);
-    if (state === undefined) {
+  private async reconcileState(generation: number) {
+    let state;
+    try {
+      state = await this.platform.webHelper.getState(this.sn);
+    } catch (error) {
+      // getState already handles its own errors, but a throw here would land in
+      // a floating promise and take the whole Homebridge process down with it
+      this.platform.log.error(
+        'Failed to re-read device state to reconcile. Device: %s, Error: %s',
+        this.accessory.context.device.deviceName,
+        error instanceof Error ? error.message : String(error),
+      );
+      return;
+    }
+
+    // A newer command landed while this read was in flight; writing its result
+    // now would visibly revert the user's change in the Home app
+    if (generation !== this.reconcileGeneration) {
+      return;
+    }
+
+    // Nullish rather than strictly undefined: the API returns response.data
+    // .data.mixed, which can be null, and null would pass an undefined check
+    // and then throw on property access
+    if (!state) {
       this.platform.log.warn(
         'Could not re-read device state to reconcile, HomeKit may be showing a stale value. Device: %s',
         this.accessory.context.device.deviceName,
