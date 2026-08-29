@@ -1,11 +1,19 @@
 import { Service, PlatformAccessory } from 'homebridge';
 import { DreoPlatform } from '../platform';
 import { BaseAccessory } from './BaseAccessory';
-
-// Fallback ceiling for a power-on confirmation. Measured round trips on a
-// healthy socket are 32-44ms, so this only expires when something is wrong;
-// it is a backstop, not the expected path.
-const POWER_ON_CONFIRM_TIMEOUT_MS = 1000;
+import {
+  getFanCapabilities,
+  isAuthoritativeDeviceReport,
+} from './FanCapabilities';
+import {
+  removeUnsupportedCharacteristic,
+  removeUnsupportedService,
+} from './AccessoryCapabilities';
+import {
+  ConfirmedController,
+  type DreoCommand,
+  type DreoState,
+} from '../reliability/ConfirmedController';
 
 // How long to let commands settle before re-reading authoritative state. Long
 // enough for the device to actually apply and report a change (observed at
@@ -38,14 +46,7 @@ export class FanAccessory extends BaseAccessory {
   private service: Service;
   private temperatureService?: Service;
   private lightService?: Service;
-
-  // In-flight power-on transition; concurrent speed requests await the same
-  // transition so none of them sends windlevel while the fan is still powering on
-  private powerOnTransition: Promise<void> | null = null;
-
-  // Retires the in-flight transition above. Held on the instance because the
-  // device's confirmation arrives in the WebSocket message handler, not here.
-  private resolvePowerOn: (() => void) | null = null;
+  private readonly confirmedController: ConfirmedController;
 
   // Debounce handle for the post-command reconciliation read
   private reconcileTimer?: NodeJS.Timeout;
@@ -77,23 +78,24 @@ export class FanAccessory extends BaseAccessory {
     // Call base class constructor
     super(platform, accessory);
 
-    // Initialize fan values
-    // Get max fan speed from Dreo API
-    this.currState.maxSpeed =
-      accessory.context.device.controlsConf.control.find(
-        (params) => params.type === 'Speed',
-      ).items[1].text;
-    // Load current state from Dreo API
+    this.confirmedController = new ConfirmedController({
+      send: (deviceSn: string, command: DreoCommand): string =>
+        this.platform.webHelper.control(deviceSn, command),
+      getState: (deviceSn: string): Promise<DreoState | undefined> =>
+        this.platform.webHelper.getState(deviceSn),
+      sleep: (milliseconds: number): Promise<void> =>
+        new Promise((resolve: () => void) => setTimeout(resolve, milliseconds)),
+      attempts: 2,
+      confirmationDelayMs: 1500,
+    });
+
+    const capabilities = getFanCapabilities(accessory.context.device, state);
+    this.currState.maxSpeed = capabilities.maxSpeed;
+    this.currState.powerCMD = capabilities.powerCommand;
+    this.currState.swingCMD = capabilities.swingCommand;
     this.currState.speed =
       (state.windlevel.state * 100) / this.currState.maxSpeed;
-    // Some fans use different commands to toggle power, determine which one should be used
-    if (state.fanon !== undefined) {
-      this.currState.powerCMD = 'fanon';
-      this.currState.on = state.fanon.state;
-    } else {
-      this.currState.powerCMD = 'poweron';
-      this.currState.on = state.poweron.state;
-    }
+    this.currState.on = Boolean(state[this.currState.powerCMD].state);
 
     // Get the Fanv2 service if it exists, otherwise create a new Fanv2 service
     // You can create multiple services for each accessory
@@ -126,15 +128,8 @@ export class FanAccessory extends BaseAccessory {
       .onSet(this.setRotationSpeed.bind(this))
       .onGet(this.getRotationSpeed.bind(this));
 
-    // Check whether fan supports oscillation
-    // Some fans use different commands to toggle oscillation, determine which one should be used
-    const swing = accessory.context.device.controlsConf.control.find(
-      (params) => params.type === 'Oscillation',
-    );
-    if (swing !== undefined) {
-      this.currState.swingCMD = swing.cmd;
-    }
-
+    // Check whether fan supports oscillation. Air circulators advertise this as
+    // DPad while reporting the actual boolean/mode through oscmode.
     if (this.currState.swingCMD !== 'none') {
       // Register handlers for Swing Mode (oscillation)
       this.service
@@ -142,6 +137,12 @@ export class FanAccessory extends BaseAccessory {
         .onSet(this.setSwingMode.bind(this))
         .onGet(this.getSwingMode.bind(this));
       this.currState.swing = state[this.currState.swingCMD].state;
+    } else {
+      removeUnsupportedCharacteristic(
+        this.service,
+        this.platform.Characteristic.SwingMode,
+        false,
+      );
     }
 
     // Check if mode control is supported
@@ -152,6 +153,12 @@ export class FanAccessory extends BaseAccessory {
         .onSet(this.setMode.bind(this))
         .onGet(this.getMode.bind(this));
       this.currState.autoMode = this.convertModeToBoolean(state.mode.state);
+    } else {
+      removeUnsupportedCharacteristic(
+        this.service,
+        this.platform.Characteristic.TargetFanState,
+        false,
+      );
     }
 
     // Check if child lock is supported
@@ -162,6 +169,12 @@ export class FanAccessory extends BaseAccessory {
         .onSet(this.setLockPhysicalControls.bind(this))
         .onGet(this.getLockPhysicalControls.bind(this));
       this.currState.lockPhysicalControls = Boolean(state.childlockon.state);
+    } else {
+      removeUnsupportedCharacteristic(
+        this.service,
+        this.platform.Characteristic.LockPhysicalControls,
+        false,
+      );
     }
 
     const shouldHideTemperatureSensor =
@@ -222,6 +235,12 @@ export class FanAccessory extends BaseAccessory {
         .getCharacteristic(this.platform.Characteristic.Brightness)
         .onSet(this.setBrightness.bind(this))
         .onGet(this.getBrightness.bind(this));
+    } else {
+      removeUnsupportedService(
+        this.accessory,
+        this.platform.Service.Lightbulb,
+        false,
+      );
     }
 
     // Update values from Dreo app
@@ -250,8 +269,7 @@ export class FanAccessory extends BaseAccessory {
 
         // A control-reply only echoes the value that was requested; it is not
         // evidence the hardware complied. Only the device's own report is.
-        const isDeviceReport =
-          data.method === 'control-report' || data.method === 'report';
+        const isDeviceReport = isAuthoritativeDeviceReport(data.method);
 
         // Check if we need to update fan state in homekit
         if (
@@ -260,6 +278,10 @@ export class FanAccessory extends BaseAccessory {
           data.reported !== null
         ) {
           Object.keys(data.reported).forEach((key) => {
+            const isErrorDetail = key === 'error_code' || key === 'error_msg';
+            if (!isDeviceReport && !isErrorDetail) {
+              return;
+            }
             switch (key) {
               case 'poweron':
                 this.currState.on = data.reported.poweron;
@@ -267,9 +289,6 @@ export class FanAccessory extends BaseAccessory {
                   .getCharacteristic(this.platform.Characteristic.Active)
                   .updateValue(this.currState.on);
                 this.platform.log.debug('Fan power:', data.reported.poweron);
-                if (this.currState.on && isDeviceReport) {
-                  this.confirmPowerOn();
-                }
                 break;
               case 'fanon':
                 this.currState.on = data.reported.fanon;
@@ -277,9 +296,6 @@ export class FanAccessory extends BaseAccessory {
                   .getCharacteristic(this.platform.Characteristic.Active)
                   .updateValue(this.currState.on);
                 this.platform.log.debug('Fan power:', data.reported.fanon);
-                if (this.currState.on && isDeviceReport) {
-                  this.confirmPowerOn();
-                }
                 break;
               case 'windlevel':
                 this.currState.speed =
@@ -414,21 +430,54 @@ export class FanAccessory extends BaseAccessory {
         }
       }
     });
+
+    platform.webHelper.addEventListener('open', () => {
+      this.platform.log.info(
+        'Refreshing fan state after Dreo WebSocket connection opened. Device: %s',
+        this.accessory.context.device.deviceName,
+      );
+      this.scheduleStateReconciliation();
+    });
+  }
+
+  private async controlAndConfirm(
+    command: DreoCommand,
+    expectedState: Readonly<Record<string, boolean | number | string>>,
+  ): Promise<DreoState> {
+    try {
+      const result = await this.confirmedController.execute({
+        deviceSn: this.sn,
+        command,
+        expectedState,
+      });
+      this.platform.log.info(
+        'Confirmed Dreo control command. CommandId: %s, Expected: %s',
+        result.commandId,
+        JSON.stringify(expectedState),
+      );
+      return result.state;
+    } catch (error) {
+      this.platform.log.error(
+        'Dreo control command failed confirmation. Command: %s, Error: %s',
+        JSON.stringify(command),
+        error instanceof Error ? error.message : String(error),
+      );
+      throw error;
+    }
   }
 
   // Handle requests to set the "Active" characteristic
-  setActive(value) {
-    this.platform.log.debug('Triggered SET Active:', value);
-    // Always send, even when the cached state already matches the request.
-    // The cache is only as good as the last report the device sent, and Dreo
-    // acknowledges a command before the hardware has necessarily complied — so
-    // a cache that has drifted would silently swallow the command here, with no
-    // send and no error. A redundant power command is harmless; a dropped one
-    // breaks the automation that issued it.
-    this.platform.webHelper.control(this.sn, {
-      [this.currState.powerCMD]: Boolean(value),
-    });
-    this.scheduleStateReconciliation();
+  async setActive(value) {
+    const active = Boolean(value);
+    this.platform.log.debug('Triggered SET Active:', active);
+    await this.controlAndConfirm(
+      { [this.currState.powerCMD]: active },
+      { [this.currState.powerCMD]: active },
+    );
+    this.currState.on = active;
+    this.service
+      .getCharacteristic(this.platform.Characteristic.Active)
+      .updateValue(active);
   }
 
   // Handle requests to get the current value of the "Active" characteristic
@@ -438,30 +487,29 @@ export class FanAccessory extends BaseAccessory {
 
   // Handle requests to set the fan speed
   async setRotationSpeed(value) {
-    // Rotation speed needs to be scaled from HomeKit's percentage value (Dreo app uses whole numbers, ex. 1-6)
     const converted = Math.round((value * this.currState.maxSpeed) / 100);
-    // Avoid setting speed to 0 (illegal value)
-    if (converted !== 0) {
-      this.platform.log.debug('Setting fan speed:', converted);
-      if (!this.currState.on && this.powerOnTransition === null) {
-        // Some Dreo devices ignore windlevel when it's sent in the same packet
-        // as the power-on command, so power on first and wait for the device to
-        // confirm before sending the speed command. currState.on is updated by
-        // the device's websocket report rather than optimistically here.
-        this.platform.log.debug('Fan is off, powering on before setting speed');
-        this.platform.webHelper.control(this.sn, {
-          [this.currState.powerCMD]: true,
-        });
-        this.powerOnTransition = this.awaitPowerOnConfirmation();
-      }
-      if (this.powerOnTransition) {
-        await this.powerOnTransition;
-      }
-      this.platform.webHelper.control(this.sn, {
-        windlevel: converted,
-      });
-      this.scheduleStateReconciliation();
+    if (converted === 0) {
+      await this.setActive(false);
+      return;
     }
+
+    this.platform.log.debug('Setting fan speed:', converted);
+    if (!this.currState.on) {
+      this.platform.log.debug('Fan is off, powering on before setting speed');
+      await this.controlAndConfirm(
+        { [this.currState.powerCMD]: true },
+        { [this.currState.powerCMD]: true },
+      );
+      this.currState.on = true;
+    }
+    await this.controlAndConfirm(
+      { windlevel: converted },
+      { windlevel: converted },
+    );
+    this.currState.speed = (converted * 100) / this.currState.maxSpeed;
+    this.service
+      .getCharacteristic(this.platform.Characteristic.RotationSpeed)
+      .updateValue(this.currState.speed);
   }
 
   // Dreo answers a command with control-reply, which only echoes back the value
@@ -557,44 +605,19 @@ export class FanAccessory extends BaseAccessory {
     }
   }
 
-  // Resolve once the device reports that it is on, rather than after a fixed
-  // delay. A fixed delay is either dead time or too short, and when it is too
-  // short the speed command lands while the fan is still off and is discarded.
-  private awaitPowerOnConfirmation(): Promise<void> {
-    const transition = new Promise<void>((resolve) => {
-      this.resolvePowerOn = resolve;
-    });
-    // The executor above runs synchronously, so resolvePowerOn is set by here
-    const timeout = setTimeout(() => {
-      this.platform.log.warn(
-        'Timed out waiting for the fan to confirm power-on, sending speed anyway. Timeout: %dms',
-        POWER_ON_CONFIRM_TIMEOUT_MS,
-      );
-      this.resolvePowerOn?.();
-    }, POWER_ON_CONFIRM_TIMEOUT_MS);
-
-    return transition.finally(() => {
-      clearTimeout(timeout);
-      this.resolvePowerOn = null;
-      this.powerOnTransition = null;
-    });
-  }
-
-  // Called from the WebSocket message handler when the device reports power on
-  private confirmPowerOn() {
-    this.resolvePowerOn?.();
-  }
-
   async getRotationSpeed() {
     return this.currState.speed;
   }
 
   // Turn oscillation on/off
   async setSwingMode(value) {
-    this.platform.webHelper.control(this.sn, {
-      [this.currState.swingCMD]:
-        this.currState.swingCMD === 'oscmode' ? Number(value) : Boolean(value),
-    });
+    const swingValue =
+      this.currState.swingCMD === 'oscmode' ? Number(value) : Boolean(value);
+    await this.controlAndConfirm(
+      { [this.currState.swingCMD]: swingValue },
+      { [this.currState.swingCMD]: swingValue },
+    );
+    this.currState.swing = Boolean(value);
   }
 
   async getSwingMode() {
@@ -603,9 +626,9 @@ export class FanAccessory extends BaseAccessory {
 
   // Set fan mode
   async setMode(value) {
-    this.platform.webHelper.control(this.sn, {
-      mode: value === this.platform.Characteristic.TargetFanState.AUTO ? 4 : 1,
-    });
+    const mode = value === this.platform.Characteristic.TargetFanState.AUTO ? 4 : 1;
+    await this.controlAndConfirm({ mode }, { mode });
+    this.currState.autoMode = this.convertModeToBoolean(mode);
   }
 
   async getMode() {
@@ -614,7 +637,9 @@ export class FanAccessory extends BaseAccessory {
 
   // Turn child lock on/off
   async setLockPhysicalControls(value) {
-    this.platform.webHelper.control(this.sn, { childlockon: Number(value) });
+    const childlockon = Number(value);
+    await this.controlAndConfirm({ childlockon }, { childlockon });
+    this.currState.lockPhysicalControls = Boolean(value);
   }
 
   getLockPhysicalControls() {
@@ -636,18 +661,22 @@ export class FanAccessory extends BaseAccessory {
     return value === 4;
   }
 
-  setLightOn(value: any) {
-    this.platform.log.debug('Triggered SET Light On:', value);
-    this.platform.webHelper.control(this.sn, { lighton: Boolean(value) });
+  async setLightOn(value: any) {
+    const lighton = Boolean(value);
+    this.platform.log.debug('Triggered SET Light On:', lighton);
+    await this.controlAndConfirm({ lighton }, { lighton });
+    this.currState.lightOn = lighton;
   }
 
   getLightOn() {
     return this.currState.lightOn;
   }
 
-  setBrightness(value) {
-    this.platform.log.debug('Triggered SET Brightness:', value);
-    this.platform.webHelper.control(this.sn, { brightness: value });
+  async setBrightness(value) {
+    const brightness = Number(value);
+    this.platform.log.debug('Triggered SET Brightness:', brightness);
+    await this.controlAndConfirm({ brightness }, { brightness });
+    this.currState.brightness = brightness;
   }
 
   getBrightness() {

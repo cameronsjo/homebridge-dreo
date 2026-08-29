@@ -4,6 +4,7 @@ import { PLATFORM_NAME, PLUGIN_NAME } from './settings';
 import { FanAccessory } from './accessories/FanAccessory';
 import { HeaterAccessory } from './accessories/HeaterAccessory';
 import { HumidifierAccessory } from './accessories/HumidifierAccessory';
+import { refreshAccessoryMetadata } from './accessories/AccessoryMetadata';
 import DreoAPI from './DreoAPI';
 
 /**
@@ -32,8 +33,14 @@ export class DreoPlatform implements DynamicPlatformPlugin {
     // to start discovery of new accessories.
     this.api.on('didFinishLaunching', async () => {
       log.debug('Executed didFinishLaunching callback');
-      // Run the method to discover / register your devices as accessories
-      this.discoverDevices();
+      try {
+        await this.discoverDevices();
+      } catch (error) {
+        log.error(
+          'Dreo device discovery failed. Error: %s',
+          error instanceof Error ? error.message : String(error),
+        );
+      }
     });
   }
 
@@ -136,13 +143,15 @@ export class DreoPlatform implements DynamicPlatformPlugin {
         this.log.info('Adding new accessory:', device.deviceName);
         // Create a new accessory
         accessory = new this.api.platformAccessory(device.deviceName, uuid);
-        // Store a copy of the device object in the `accessory.context`
-        accessory.context.device = device;
       }
+
+      // Discovery is authoritative. Cached metadata can outlive firmware updates
+      // and otherwise leave HomeKit using obsolete capabilities or commands.
+      refreshAccessoryMetadata(accessory, device);
 
       // Get initial device state
       const state = await this.webHelper.getState(device.sn);
-      if (state === undefined) {
+      if (state === undefined || state === null) {
         // Skip this device rather than abandoning the loop — one unreachable
         // device must not stop every later device from being registered
         this.log.error('Failed to retrieve device state, skipping device. Device: %s', device.deviceName);
@@ -204,7 +213,10 @@ export class DreoPlatform implements DynamicPlatformPlugin {
           this.log.error('Error, unknown device type:', device.productName, device.model);
       }
 
-      if (!existingAccessory && modelPrefix) {
+      if (!modelPrefix && existingAccessory) {
+        this.log.info('Removing cached accessory that is no longer supported:', device.deviceName);
+        this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [existingAccessory]);
+      } else if (!existingAccessory && modelPrefix) {
         // Link accessory to the platform if model is supported
         this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
       }
