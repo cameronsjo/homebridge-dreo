@@ -49,10 +49,12 @@ npm run watch    # tsc -w (dev mode)
 
 ## Deploy
 
+Homebridge pins this plugin to a durable tarball. Build and pack locally, then overlay the package contents onto the existing module directory and refresh the pinned tarball. Do not run `npm install` during deployment: it can rewrite the wider Homebridge dependency tree.
+
 ```bash
 npm run build && npm pack --pack-destination .
 scp homebridge-dreo-*.tgz pi@192.168.1.222:/tmp/
-ssh pi@192.168.1.222 "cd /var/lib/homebridge && sudo npm install /tmp/homebridge-dreo-*.tgz && sudo systemctl restart homebridge"
+ssh pi@192.168.1.222 "rm -rf /tmp/deploy && mkdir /tmp/deploy && tar xzf /tmp/homebridge-dreo-*.tgz -C /tmp/deploy && sudo cp -r /tmp/deploy/package/. /var/lib/homebridge/node_modules/homebridge-dreo/ && sudo cp /tmp/homebridge-dreo-*.tgz /var/lib/homebridge/tarballs/ && sudo systemctl restart homebridge"
 ```
 
 ## Syncing with Upstream
