@@ -1,5 +1,5 @@
 ---
-status: approved
+status: in-progress
 issue: https://github.com/cameronsjo/homebridge-dreo/issues/4
 ---
 
@@ -21,10 +21,10 @@ Lint the complete `src` tree and type the exposed light handler without suppress
 
 ## Checklist
 
-- [ ] Correct the lint command and resolve the newly exposed type warning.
-- [ ] Add an atomic sequence operation to `ConfirmedController`.
-- [ ] Route nonzero speed changes through confirmed power-on then confirmed speed.
-- [ ] Test ordering, failure short-circuiting, and non-interleaving behavior.
-- [ ] Replace the unsafe deployment instructions with the overlay procedure.
-- [ ] Run lint, tests, build, and the complete prepublish gate.
+- [x] Correct the lint command and resolve the newly exposed type warning.
+- [x] Add an atomic sequence operation to `ConfirmedController`.
+- [x] Route nonzero speed changes through confirmed power-on then confirmed speed.
+- [x] Test ordering, failure short-circuiting, and non-interleaving behavior.
+- [x] Replace the unsafe deployment instructions with the overlay procedure.
+- [x] Run lint, tests, build, and the complete prepublish gate.
 - [ ] Close issue #4 through the pull request.
