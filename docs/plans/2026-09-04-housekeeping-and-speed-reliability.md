@@ -1,5 +1,5 @@
 ---
-status: in-progress
+status: awaiting-merge
 issue: https://github.com/cameronsjo/homebridge-dreo/issues/4
 ---
 
@@ -27,4 +27,8 @@ Lint the complete `src` tree and type the exposed light handler without suppress
 - [x] Test ordering, failure short-circuiting, and non-interleaving behavior.
 - [x] Replace the unsafe deployment instructions with the overlay procedure.
 - [x] Run lint, tests, build, and the complete prepublish gate.
-- [ ] Close issue #4 through the pull request.
+- [ ] Merge pull request #6; issue #4 closes automatically.
+
+## Next step
+
+Merge [pull request #6](https://github.com/cameronsjo/homebridge-dreo/pull/6), deploy through the documented overlay procedure during an approved window, and smoke-test off-to-speed, on-to-speed, rapid speed changes, and speed-to-zero.
