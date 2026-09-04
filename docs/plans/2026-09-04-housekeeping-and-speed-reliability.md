@@ -1,0 +1,30 @@
+---
+status: approved
+issue: https://github.com/cameronsjo/homebridge-dreo/issues/4
+---
+
+# Complete housekeeping and speed reliability work
+
+## Goal
+
+Restore lint coverage over accessory logic, prevent stale cached power state from swallowing the first fan-speed command, and replace deployment guidance that can damage the Homebridge installation.
+
+## Chosen approach
+
+Lint the complete `src` tree and type the exposed light handler without suppression. For every nonzero speed request, enqueue one atomic per-device sequence that confirms an idempotent power-on before sending and confirming `windlevel`; stop the sequence when power confirmation fails. Replace `npm install` deployment guidance with the established unpack-and-overlay procedure and durable tarball refresh.
+
+## Alternatives declined
+
+- A fresh state read before every speed command adds latency and a read/action race merely to avoid a harmless redundant power command.
+- Sending power and speed together is rejected because some Dreo devices ignore bundled `windlevel` changes.
+- Two separate queue entries allow another HomeKit operation to interleave between power and speed.
+
+## Checklist
+
+- [ ] Correct the lint command and resolve the newly exposed type warning.
+- [ ] Add an atomic sequence operation to `ConfirmedController`.
+- [ ] Route nonzero speed changes through confirmed power-on then confirmed speed.
+- [ ] Test ordering, failure short-circuiting, and non-interleaving behavior.
+- [ ] Replace the unsafe deployment instructions with the overlay procedure.
+- [ ] Run lint, tests, build, and the complete prepublish gate.
+- [ ] Close issue #4 through the pull request.
