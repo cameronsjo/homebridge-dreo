@@ -25,6 +25,8 @@ export interface ConfirmedControlResult {
   readonly state: DreoState;
 }
 
+export type ConfirmedControlStep = Omit<ConfirmedControlRequest, 'deviceSn'>;
+
 export class ConfirmedController {
   private readonly deviceQueues = new Map<string, Promise<void>>();
 
@@ -35,18 +37,45 @@ export class ConfirmedController {
   }
 
   public execute(request: ConfirmedControlRequest): Promise<ConfirmedControlResult> {
-    const previous = this.deviceQueues.get(request.deviceSn) ?? Promise.resolve();
-    const operation = previous
-      .catch((): void => undefined)
-      .then((): Promise<ConfirmedControlResult> => this.executeNow(request));
+    return this.enqueue(request.deviceSn, (): Promise<ConfirmedControlResult> =>
+      this.executeNow(request),
+    );
+  }
+
+  public executeSequence(
+    deviceSn: string,
+    steps: readonly ConfirmedControlStep[],
+    onStepConfirmed?: (index: number, result: ConfirmedControlResult) => void,
+  ): Promise<readonly ConfirmedControlResult[]> {
+    if (steps.length === 0) {
+      return Promise.reject(new Error('A confirmed control sequence must contain at least one step.'));
+    }
+
+    return this.enqueue(deviceSn, async (): Promise<readonly ConfirmedControlResult[]> => {
+      const results: ConfirmedControlResult[] = [];
+      for (let index = 0; index < steps.length; index += 1) {
+        const result = await this.executeNow({ deviceSn, ...steps[index] });
+        results.push(result);
+        // Notify the caller as soon as this step is confirmed, not after the
+        // whole sequence resolves — a later step's failure must not hide that
+        // an earlier step's effect on the physical device already landed.
+        onStepConfirmed?.(index, result);
+      }
+      return results;
+    });
+  }
+
+  private enqueue<Result>(deviceSn: string, execute: () => Promise<Result>): Promise<Result> {
+    const previous = this.deviceQueues.get(deviceSn) ?? Promise.resolve();
+    const operation = previous.catch((): void => undefined).then(execute);
     const settled = operation.then(
       (): void => undefined,
       (): void => undefined,
     );
-    this.deviceQueues.set(request.deviceSn, settled);
+    this.deviceQueues.set(deviceSn, settled);
     void settled.finally((): void => {
-      if (this.deviceQueues.get(request.deviceSn) === settled) {
-        this.deviceQueues.delete(request.deviceSn);
+      if (this.deviceQueues.get(deviceSn) === settled) {
+        this.deviceQueues.delete(deviceSn);
       }
     });
     return operation;
@@ -68,7 +97,8 @@ export class ConfirmedController {
       Object.keys(request.expectedState).map((key: string) => [key, latestState?.[key]?.state]),
     );
     throw new Error(
-      `Dreo command ${commandId} was not confirmed. Expected: ${JSON.stringify(request.expectedState)}, Actual: ${JSON.stringify(actualState)}`,
+      `Dreo command ${commandId} was not confirmed. ` +
+      `Expected: ${JSON.stringify(request.expectedState)}, Actual: ${JSON.stringify(actualState)}`,
     );
   }
 

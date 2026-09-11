@@ -1,4 +1,4 @@
-import { Service, PlatformAccessory } from 'homebridge';
+import { Service, PlatformAccessory, type CharacteristicValue } from 'homebridge';
 import { DreoPlatform } from '../platform';
 import { BaseAccessory } from './BaseAccessory';
 import {
@@ -11,6 +11,7 @@ import {
 } from './AccessoryCapabilities';
 import {
   ConfirmedController,
+  type ConfirmedControlStep,
   type DreoCommand,
   type DreoState,
 } from '../reliability/ConfirmedController';
@@ -466,6 +467,34 @@ export class FanAccessory extends BaseAccessory {
     }
   }
 
+  private async controlAndConfirmSequence(
+    steps: readonly ConfirmedControlStep[],
+    onStepConfirmed?: (index: number, state: DreoState) => void,
+  ): Promise<readonly DreoState[]> {
+    try {
+      const results = await this.confirmedController.executeSequence(
+        this.sn,
+        steps,
+        (index, result) => {
+          this.platform.log.info(
+            'Confirmed Dreo control command. CommandId: %s, Expected: %s',
+            result.commandId,
+            JSON.stringify(steps[index].expectedState),
+          );
+          onStepConfirmed?.(index, result.state);
+        },
+      );
+      return results.map((result) => result.state);
+    } catch (error) {
+      this.platform.log.error(
+        'Dreo control sequence failed confirmation. Commands: %s, Error: %s',
+        JSON.stringify(steps.map((step) => step.command)),
+        error instanceof Error ? error.message : String(error),
+      );
+      throw error;
+    }
+  }
+
   // Handle requests to set the "Active" characteristic
   async setActive(value) {
     const active = Boolean(value);
@@ -494,17 +523,25 @@ export class FanAccessory extends BaseAccessory {
     }
 
     this.platform.log.debug('Setting fan speed:', converted);
-    if (!this.currState.on) {
-      this.platform.log.debug('Fan is off, powering on before setting speed');
-      await this.controlAndConfirm(
-        { [this.currState.powerCMD]: true },
-        { [this.currState.powerCMD]: true },
-      );
-      this.currState.on = true;
-    }
-    await this.controlAndConfirm(
-      { windlevel: converted },
-      { windlevel: converted },
+    await this.controlAndConfirmSequence(
+      [
+        {
+          command: { [this.currState.powerCMD]: true },
+          expectedState: { [this.currState.powerCMD]: true },
+        },
+        {
+          command: { windlevel: converted },
+          expectedState: { windlevel: converted },
+        },
+      ],
+      (index) => {
+        // Power-on is step 0. Mark the device on the instant it confirms —
+        // even if the speed step that follows later fails — so the cached
+        // state can't drift stale against a device that already powered on.
+        if (index === 0) {
+          this.currState.on = true;
+        }
+      },
     );
     this.currState.speed = (converted * 100) / this.currState.maxSpeed;
     this.service
@@ -661,7 +698,7 @@ export class FanAccessory extends BaseAccessory {
     return value === 4;
   }
 
-  async setLightOn(value: any) {
+  async setLightOn(value: CharacteristicValue) {
     const lighton = Boolean(value);
     this.platform.log.debug('Triggered SET Light On:', lighton);
     await this.controlAndConfirm({ lighton }, { lighton });
