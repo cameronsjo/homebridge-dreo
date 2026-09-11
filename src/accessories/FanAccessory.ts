@@ -469,16 +469,21 @@ export class FanAccessory extends BaseAccessory {
 
   private async controlAndConfirmSequence(
     steps: readonly ConfirmedControlStep[],
+    onStepConfirmed?: (index: number, state: DreoState) => void,
   ): Promise<readonly DreoState[]> {
     try {
-      const results = await this.confirmedController.executeSequence(this.sn, steps);
-      results.forEach((result, index) => {
-        this.platform.log.info(
-          'Confirmed Dreo control command. CommandId: %s, Expected: %s',
-          result.commandId,
-          JSON.stringify(steps[index].expectedState),
-        );
-      });
+      const results = await this.confirmedController.executeSequence(
+        this.sn,
+        steps,
+        (index, result) => {
+          this.platform.log.info(
+            'Confirmed Dreo control command. CommandId: %s, Expected: %s',
+            result.commandId,
+            JSON.stringify(steps[index].expectedState),
+          );
+          onStepConfirmed?.(index, result.state);
+        },
+      );
       return results.map((result) => result.state);
     } catch (error) {
       this.platform.log.error(
@@ -518,17 +523,26 @@ export class FanAccessory extends BaseAccessory {
     }
 
     this.platform.log.debug('Setting fan speed:', converted);
-    await this.controlAndConfirmSequence([
-      {
-        command: { [this.currState.powerCMD]: true },
-        expectedState: { [this.currState.powerCMD]: true },
+    await this.controlAndConfirmSequence(
+      [
+        {
+          command: { [this.currState.powerCMD]: true },
+          expectedState: { [this.currState.powerCMD]: true },
+        },
+        {
+          command: { windlevel: converted },
+          expectedState: { windlevel: converted },
+        },
+      ],
+      (index) => {
+        // Power-on is step 0. Mark the device on the instant it confirms —
+        // even if the speed step that follows later fails — so the cached
+        // state can't drift stale against a device that already powered on.
+        if (index === 0) {
+          this.currState.on = true;
+        }
       },
-      {
-        command: { windlevel: converted },
-        expectedState: { windlevel: converted },
-      },
-    ]);
-    this.currState.on = true;
+    );
     this.currState.speed = (converted * 100) / this.currState.maxSpeed;
     this.service
       .getCharacteristic(this.platform.Characteristic.RotationSpeed)

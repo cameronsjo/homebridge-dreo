@@ -45,6 +45,7 @@ export class ConfirmedController {
   public executeSequence(
     deviceSn: string,
     steps: readonly ConfirmedControlStep[],
+    onStepConfirmed?: (index: number, result: ConfirmedControlResult) => void,
   ): Promise<readonly ConfirmedControlResult[]> {
     if (steps.length === 0) {
       return Promise.reject(new Error('A confirmed control sequence must contain at least one step.'));
@@ -52,8 +53,13 @@ export class ConfirmedController {
 
     return this.enqueue(deviceSn, async (): Promise<readonly ConfirmedControlResult[]> => {
       const results: ConfirmedControlResult[] = [];
-      for (const step of steps) {
-        results.push(await this.executeNow({ deviceSn, ...step }));
+      for (let index = 0; index < steps.length; index += 1) {
+        const result = await this.executeNow({ deviceSn, ...steps[index] });
+        results.push(result);
+        // Notify the caller as soon as this step is confirmed, not after the
+        // whole sequence resolves — a later step's failure must not hide that
+        // an earlier step's effect on the physical device already landed.
+        onStepConfirmed?.(index, result);
       }
       return results;
     });
