@@ -80,6 +80,10 @@ export class DreoPlatform implements DynamicPlatformPlugin {
     if (auth.region === 'EU') {
       this.webHelper.server = 'eu';
       auth = await this.webHelper.authenticate();
+      if (auth === undefined) {
+        this.log.error('Authentication error: Failed to obtain access_token from the EU server');
+        return;
+      }
     } else if (auth.region !== 'NA') {
       this.log.error('error, unknown region');
       this.log.error('Please open a github issue and provide your Country and Region (shown above)');
@@ -120,106 +124,122 @@ export class DreoPlatform implements DynamicPlatformPlugin {
 
     // Loop over the discovered devices and register each one if it has not already been registered
     for (const device of dreoDevices) {
-      // Print device info:
-      this.log.debug('Control config: ', JSON.stringify(device.controlsConf, null, 2));
-
-      // Generate a unique id for the accessory this should be generated from
-      // something globally unique, but constant, for example, the device serial
-      // number or MAC address
-      const uuid = this.api.hap.uuid.generate(device.sn);
-
-      // See if an accessory with the same uuid has already been registered and restored from
-      // the cached devices we stored in the `configureAccessory` method above
-      const existingAccessory = this.accessories.find(accessory => accessory.UUID === uuid);
-
-      let accessory: PlatformAccessory;
-
-      if (existingAccessory) {
-        // The accessory already exists
-        this.log.info('Restoring existing accessory from cache:', device.deviceName);
-        accessory = existingAccessory;
-      } else {
-        // The accessory does not yet exist, so we need to create it
-        this.log.info('Adding new accessory:', device.deviceName);
-        // Create a new accessory
-        accessory = new this.api.platformAccessory(device.deviceName, uuid);
+      // One device with an unexpected payload must not stop every later device
+      // from being set up. Accessory constructors read state fields directly and
+      // throw on a missing one.
+      try {
+        await this.setUpDevice(device);
+      } catch (error) {
+        this.log.error(
+          'Failed to set up Dreo device, skipping it. Device: %s, Model: %s, Error: %s',
+          device.deviceName,
+          device.model,
+          error instanceof Error ? error.message : String(error),
+        );
       }
+    }
+  }
 
-      // Discovery is authoritative. Cached metadata can outlive firmware updates
-      // and otherwise leave HomeKit using obsolete capabilities or commands.
-      refreshAccessoryMetadata(accessory, device);
+  private async setUpDevice(device) {
+    // Print device info:
+    this.log.debug('Control config: ', JSON.stringify(device.controlsConf, null, 2));
 
-      // Get initial device state
-      const state = await this.webHelper.getState(device.sn);
-      if (state === undefined || state === null) {
-        // Skip this device rather than abandoning the loop — one unreachable
-        // device must not stop every later device from being registered
-        this.log.error('Failed to retrieve device state, skipping device. Device: %s', device.deviceName);
-        continue;
-      }
-      this.log.debug('Accessory state:', state);
+    // Generate a unique id for the accessory this should be generated from
+    // something globally unique, but constant, for example, the device serial
+    // number or MAC address
+    const uuid = this.api.hap.uuid.generate(device.sn);
 
-      // Create the accessory handler for new/restored accessory
-      // This is imported from `platformAccessory.ts`
+    // See if an accessory with the same uuid has already been registered and restored from
+    // the cached devices we stored in the `configureAccessory` method above
+    const existingAccessory = this.accessories.find(accessory => accessory.UUID === uuid);
 
-      // List of supported model prefixes
-      const SUPPORTED_MODEL_PREFIXES = [
-        'DR-HTF',  // Tower Fan
-        'DR-HAF',  // Air Circulator
-        'DR-HPF',  // Air Circulator
-        'DR-HCF',  // Ceiling Fan
-        'DR-HAP',  // Air Purifier
-        'DR-HSH',  // Heater
-        'WH',      // Heater
-        'DR-HAC',  // Air Conditioner
-        'DR-HHM',  // Humidifier
-      ];
+    let accessory: PlatformAccessory;
 
-      // Find the matching prefix
-      let modelPrefix = SUPPORTED_MODEL_PREFIXES.find(prefix => device.model.startsWith(prefix));
+    if (existingAccessory) {
+      // The accessory already exists
+      this.log.info('Restoring existing accessory from cache:', device.deviceName);
+      accessory = existingAccessory;
+    } else {
+      // The accessory does not yet exist, so we need to create it
+      this.log.info('Adding new accessory:', device.deviceName);
+      // Create a new accessory
+      accessory = new this.api.platformAccessory(device.deviceName, uuid);
+    }
 
-      // Determine device type based on the matched prefix
-      switch (modelPrefix) {
-        case 'DR-HTF':
-        case 'DR-HAF':
-        case 'DR-HPF':
-        case 'DR-HCF':
-        case 'DR-HAP':
-          // Tower Fan, Air Circulator, Ceiling Fan, Air Purifier
-          accessory.category = this.api.hap.Categories.FAN;
-          new FanAccessory(this, accessory, state);
-          break;
+    // Discovery is authoritative. Cached metadata can outlive firmware updates
+    // and otherwise leave HomeKit using obsolete capabilities or commands.
+    refreshAccessoryMetadata(accessory, device);
 
-        case 'DR-HSH':
-        case 'WH':
-          // Heater
-          accessory.category = this.api.hap.Categories.AIR_HEATER;
-          new HeaterAccessory(this, accessory, state);
-          break;
-        case 'DR-HAC':
-          // Air Conditioner
-          // new CoolerAccessory(this, accessory, state);
-          this.log.info('Air Conditioner not yet supported');
-          modelPrefix = undefined;
-          break;
+    // Get initial device state
+    const state = await this.webHelper.getState(device.sn);
+    if (state === undefined || state === null) {
+      // Skip this device rather than abandoning the loop — one unreachable
+      // device must not stop every later device from being registered
+      this.log.error('Failed to retrieve device state, skipping device. Device: %s', device.deviceName);
+      return;
+    }
+    this.log.debug('Accessory state:', state);
 
-        case 'DR-HHM':
-          // Humidifier
-          accessory.category = this.api.hap.Categories.AIR_HUMIDIFIER;
-          new HumidifierAccessory(this, accessory, state);
-          break;
+    // Create the accessory handler for new/restored accessory
+    // This is imported from `platformAccessory.ts`
 
-        default:
-          this.log.error('Error, unknown device type:', device.productName, device.model);
-      }
+    // List of supported model prefixes
+    const SUPPORTED_MODEL_PREFIXES = [
+      'DR-HTF',  // Tower Fan
+      'DR-HAF',  // Air Circulator
+      'DR-HPF',  // Air Circulator
+      'DR-HCF',  // Ceiling Fan
+      'DR-HAP',  // Air Purifier
+      'DR-HSH',  // Heater
+      'WH',      // Heater
+      'DR-HAC',  // Air Conditioner
+      'DR-HHM',  // Humidifier
+    ];
 
-      if (!modelPrefix && existingAccessory) {
-        this.log.info('Removing cached accessory that is no longer supported:', device.deviceName);
-        this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [existingAccessory]);
-      } else if (!existingAccessory && modelPrefix) {
-        // Link accessory to the platform if model is supported
-        this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
-      }
+    // Find the matching prefix
+    let modelPrefix = SUPPORTED_MODEL_PREFIXES.find(prefix => device.model.startsWith(prefix));
+
+    // Determine device type based on the matched prefix
+    switch (modelPrefix) {
+      case 'DR-HTF':
+      case 'DR-HAF':
+      case 'DR-HPF':
+      case 'DR-HCF':
+      case 'DR-HAP':
+        // Tower Fan, Air Circulator, Ceiling Fan, Air Purifier
+        accessory.category = this.api.hap.Categories.FAN;
+        new FanAccessory(this, accessory, state);
+        break;
+
+      case 'DR-HSH':
+      case 'WH':
+        // Heater
+        accessory.category = this.api.hap.Categories.AIR_HEATER;
+        new HeaterAccessory(this, accessory, state);
+        break;
+      case 'DR-HAC':
+        // Air Conditioner
+        // new CoolerAccessory(this, accessory, state);
+        this.log.info('Air Conditioner not yet supported');
+        modelPrefix = undefined;
+        break;
+
+      case 'DR-HHM':
+        // Humidifier
+        accessory.category = this.api.hap.Categories.AIR_HUMIDIFIER;
+        new HumidifierAccessory(this, accessory, state);
+        break;
+
+      default:
+        this.log.error('Error, unknown device type:', device.productName, device.model);
+    }
+
+    if (!modelPrefix && existingAccessory) {
+      this.log.info('Removing cached accessory that is no longer supported:', device.deviceName);
+      this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [existingAccessory]);
+    } else if (!existingAccessory && modelPrefix) {
+      // Link accessory to the platform if model is supported
+      this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
     }
   }
 }
