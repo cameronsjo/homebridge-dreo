@@ -1,6 +1,7 @@
 import { Service, PlatformAccessory} from 'homebridge';
 import { DreoPlatform } from '../platform';
 import { BaseAccessory } from './BaseAccessory';
+import { ecoTemperatureRange, heatLevelFromThreshold } from './HeaterMapping';
 
 /**
  * Heater Accessory
@@ -137,11 +138,8 @@ export class HeaterAccessory extends BaseAccessory {
       .onGet(this.getCurrentTemperature.bind(this));
 
     // Register handlers for Heating Threshold Temperature
-    let ecoRange = {startValue: 41, endValue: 95};  // Default temperature range
-    // Get temperature range from Dreo control config if available (not sure why this doesn't exist for some devices)
-    if (accessory.context.device.controlsConf.schedule) {
-      ecoRange = accessory.context.device.controlsConf.schedule.modes.find(params => params.value === 'eco').controls[0];
-    }
+    // Temperature range from Dreo control config, or a default when the device has none
+    const ecoRange = ecoTemperatureRange(accessory.context.device.controlsConf);
     this.minTemp = this.convertToCelsius(ecoRange.startValue);
     this.service.getCharacteristic(this.platform.Characteristic.HeatingThresholdTemperature)
       .onSet(this.setHeatingThresholdTemperature.bind(this))
@@ -357,9 +355,7 @@ export class HeaterAccessory extends BaseAccessory {
        * We'll map the bottom 3 degree increments of the fan to these levels
        * So if the minTemp is 5C, {5: 1, 5.5: 2, 6: 3}
        */
-      value = ((value - this.minTemp) * 2) + 1;
-      value = Math.min(value, 3);  // Ensure speed is within range
-      this.platform.webHelper.control(this.sn, {'htalevel': value});
+      this.platform.webHelper.control(this.sn, {'htalevel': heatLevelFromThreshold(value, this.minTemp)});
     }
   }
 
@@ -419,7 +415,8 @@ export class HeaterAccessory extends BaseAccessory {
       }
     } else {
       // Fan only supports on/off oscillation toggle
-      this.platform.webHelper.control(this.sn, {'oscon': value});
+      // HomeKit sends SwingMode as 0/1; Dreo reports oscon as a boolean, so send the same type
+      this.platform.webHelper.control(this.sn, {'oscon': Boolean(value)});
     }
   }
 
