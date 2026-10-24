@@ -26,17 +26,14 @@ src/
     └── HumidifierAccessory.ts  # Humidifiers (newest, best-written)
 ```
 
-## Known Issues to Fix (Fork Priorities)
+## Fork Priorities
 
-| Priority | Issue | File |
-|----------|-------|------|
-| **P0** | Replace `reconnecting-websocket` — throws uncaught errors that crash Homebridge | `DreoAPI.ts` |
-| **P0** | Add token refresh on WebSocket reconnect — stale tokens cause silent permanent failure | `DreoAPI.ts` |
-| **P1** | Fix device loop `return` → `continue` — one failed state fetch abandons all remaining devices | `platform.ts:148` |
-| **P1** | Run `npm audit fix`, update axios, TypeScript toolchain | `package.json` |
-| **P2** | Add try/catch to JSON.parse in Fan/Heater message handlers | `FanAccessory.ts`, `HeaterAccessory.ts` |
-| **P2** | Add SIGTERM handler for graceful shutdown | `DreoAPI.ts` |
+Done: `reconnecting-websocket` replaced with `ws` plus backoff reconnect, token refresh on reconnect, per-device discovery isolation, guarded `JSON.parse` in every message handler, SIGTERM shutdown, `npm audit` clean.
+
+| Priority | Open item | File |
+|----------|-----------|------|
 | **P2** | Enable `noImplicitAny: true` and type untyped parameters | `tsconfig.json` |
+| **P2** | Smoke-test on Homebridge 2.x (issue #3) | — |
 
 ## Development
 
@@ -45,6 +42,7 @@ npm install
 npm run build    # rimraf ./dist && tsc
 npm run lint     # eslint
 npm run watch    # tsc -w (dev mode)
+npm test         # vitest
 ```
 
 ## Deploy
