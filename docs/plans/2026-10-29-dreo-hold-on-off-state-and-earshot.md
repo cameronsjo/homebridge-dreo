@@ -1,5 +1,6 @@
 ---
 status: "in-flight"
+next: "Part B: deploy 4.3.0 to the Pi on Cameron's restart OK, then the 1 h heartbeat check. Part C waits until the laptop is back in front of the fan."
 updated: "2026-10-29"
 session_id: "70add917-c392-4fe3-9a12-9efac3d9afde"
 model: "claude-opus-5-5"
@@ -145,3 +146,13 @@ Seats delivered findings as replies (plan mode, no report files).
 - **operability #11: script the Part A diagnosis**: Part A is done; the deploy script's version and hash check covers the repeat need.
 - **security: TLS and a pinned cert for the Homebridge UI**: moot; earshot no longer uses the UI API.
 - **red-team: "Part A recipe can't tell the builds apart"**: moot; the log content identified the build directly.
+
+## Deviations
+
+- **Part B item 1, pong test (improvement).** A standalone probe (`scripts/probe-ws-ping.cjs`) ran on the Pi next to the installed plugin instead of a temporary plugin build, so no Homebridge restart was needed. Result on 2026-10-30: 39 of 39 protocol pings answered over 10 minutes (latency 31–41 ms), zero replies to `'2'`, one server message. **Shipped variant: protocol pings, terminate after 3 consecutive missed pongs.** The 5-minute-silence fallback was not built.
+- **Part B item 1, timing.** The socket is terminated on the tick after the third unanswered ping: about 45 s after the first missed ping, up to about 60 s after the last pong.
+- **Part B item 3, naming and scope.** `DreoAPI.forceReconnect()` shipped as `requestReconnect(reason)` backed by `ReconnectGate`. From the Opus review: recovery reconnects only when the socket is not open (a confirmation miss on a healthy socket resends and reconciles without a fresh login), resends a second time if the newest HomeKit request changed during the first resend, and the 20 s open deadline covers the login too (axios calls now time out at 15 s).
+- **Part B item 1, backoff (review).** A pong or device report resets reconnect backoff only after the socket has been open 2 minutes, so a server that accepts and drops connections cannot hold backoff at 1 s.
+- **Part B item 1, socket race (review, Critical).** A forced reconnect overlapping the backoff reconnect could leave two live sockets. Fixed with a connect-generation token and by terminating the current socket before opening another; pinned by `test/dreo-api-reconnect.test.ts` (staged red).
+- **Part B item 7, deploy script shape.** `deploy-dreo.sh` (local driver) plus `deploy-dreo-remote.sh` (Pi side). The backup is the whole module dir as `tarballs/homebridge-dreo-prev-<stamp>.tgz` plus a `.pin` file holding the previous pin. Restart runs only with `--restart`. The remote half is about 160 lines of bash, over the 100-line bash limit; kept in bash to match the repo's other deploy scripts. Rollback round-trip without restart on 2026-10-30: module dir hash, pin, and `package.json` identical before and after.
+

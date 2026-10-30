@@ -111,21 +111,31 @@ describe('forced reconnect gate', () => {
   });
 });
 
-function makeRecovery(options: { reconnected: boolean; socketOpen: boolean; latest?: boolean }) {
+function makeRecovery(options: {
+  reconnected: boolean;
+  socketOpen: boolean;
+  latest?: boolean;
+  resend?: () => Promise<void>;
+  latestRequested?: () => boolean;
+}) {
   const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+  let socketOpen = options.socketOpen;
   const requestReconnect = vi.fn(() => ({
     started: true,
     reconnecting: true,
-    done: Promise.resolve(options.reconnected),
+    done: Promise.resolve(options.reconnected).then((opened) => {
+      socketOpen = opened;
+      return opened;
+    }),
   }));
-  const resend = vi.fn(async () => undefined);
+  const resend = vi.fn(options.resend ?? (async () => undefined));
   const reconcile = vi.fn();
   const recovery = new PowerRecovery({
     deviceName: 'Air Circulator',
     requestReconnect,
-    isSocketOpen: () => options.socketOpen,
+    isSocketOpen: () => socketOpen,
     resend,
-    latestRequested: () => options.latest ?? true,
+    latestRequested: options.latestRequested ?? (() => options.latest ?? true),
     reconcile,
     log,
   });
@@ -136,7 +146,7 @@ describe('power command recovery', () => {
   it('starts recovery when the socket is not open, then resends and reconciles', async () => {
     const { recovery, requestReconnect, resend, reconcile } = makeRecovery({
       reconnected: true,
-      socketOpen: true,
+      socketOpen: false,
     });
     const controller = controllerWith(() => {
       throw new Error(NOT_OPEN);
@@ -169,7 +179,7 @@ describe('power command recovery', () => {
   });
 
   it('resends the newest requested state, not the one that failed', async () => {
-    const { recovery, resend } = makeRecovery({ reconnected: true, socketOpen: true, latest: false });
+    const { recovery, resend } = makeRecovery({ reconnected: true, socketOpen: false, latest: false });
 
     await expect(
       recovery.run(true, 'poweron', async () => {
@@ -197,7 +207,7 @@ describe('power command recovery', () => {
   });
 
   it('runs one recovery at a time per device', async () => {
-    const { recovery, requestReconnect } = makeRecovery({ reconnected: true, socketOpen: true });
+    const { recovery, requestReconnect } = makeRecovery({ reconnected: true, socketOpen: false });
     const fail = async (): Promise<never> => {
       throw new Error(NOT_OPEN);
     };
@@ -209,5 +219,45 @@ describe('power command recovery', () => {
     await expect(second).rejects.toThrow('Reconnect: recovery-already-running');
     await recovery.settled();
     expect(requestReconnect).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not reconnect a healthy socket; resends and reconciles only', async () => {
+    const { recovery, requestReconnect, resend, reconcile } = makeRecovery({
+      reconnected: true,
+      socketOpen: true,
+    });
+    const controller = controllerWith(() => 'cmd-1', { poweron: { state: false } });
+
+    await expect(
+      recovery.run(true, 'poweron', () =>
+        controller.execute({ deviceSn: 'fan-1', command: { poweron: true }, expectedState: { poweron: true } }),
+      ),
+    ).rejects.toThrow('Reconnect: not-needed');
+    await recovery.settled();
+
+    expect(requestReconnect).not.toHaveBeenCalled();
+    expect(resend).toHaveBeenCalledWith(true);
+    expect(reconcile).toHaveBeenCalledTimes(1);
+  });
+
+  it('resends again when the user asks for a different state during the resend', async () => {
+    let latest = true;
+    const { recovery, resend } = makeRecovery({
+      reconnected: true,
+      socketOpen: false,
+      latestRequested: () => latest,
+      resend: async () => {
+        latest = false;
+      },
+    });
+
+    await expect(
+      recovery.run(true, 'poweron', async () => {
+        throw new Error(NOT_OPEN);
+      }),
+    ).rejects.toThrow();
+    await recovery.settled();
+
+    expect(resend.mock.calls).toEqual([[true], [false]]);
   });
 });

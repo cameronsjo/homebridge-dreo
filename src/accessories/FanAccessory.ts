@@ -484,6 +484,7 @@ export class FanAccessory extends BaseAccessory {
     });
 
     this.statePoller.start();
+    this.platform.api.on('shutdown', (): void => this.statePoller.stop());
   }
 
   private communicationFailure(): Error {

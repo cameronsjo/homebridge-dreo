@@ -23,7 +23,21 @@ export interface PowerRecoveryDependencies {
   };
 }
 
-export type ReconnectOutcome = 'started' | 'joined' | 'rate-limited' | 'recovery-already-running';
+export type ReconnectOutcome =
+  | 'started'
+  | 'joined'
+  | 'rate-limited'
+  | 'not-needed'
+  | 'recovery-already-running';
+
+// One resend for the failed request, plus one more if the user asked for a
+// different state while that resend was in flight
+const MAX_RESENDS = 2;
+
+interface PendingReconnect {
+  readonly outcome: ReconnectOutcome;
+  readonly done: Promise<boolean>;
+}
 
 export class PowerCommandFailure extends Error {
   constructor(
@@ -89,27 +103,36 @@ export class PowerRecovery {
     if (this.running) {
       return 'recovery-already-running';
     }
-    const reason = `power command failed for ${this.dependencies.deviceName}: ${
-      error instanceof Error ? error.message : String(error)
-    }`;
-    const reconnect = this.dependencies.requestReconnect(reason);
-    const outcome: ReconnectOutcome = reconnect.started
-      ? 'started'
-      : reconnect.reconnecting
-        ? 'joined'
-        : 'rate-limited';
-
+    const reconnect = this.reconnectIfClosed(error);
     this.running = this.recover(reconnect, requested).finally((): void => {
       this.running = undefined;
     });
-    return outcome;
+    return reconnect.outcome;
   }
 
-  private async recover(reconnect: ReconnectRequest, failedRequest: boolean): Promise<void> {
+  // A command can fail with the socket healthy (the device rejected it, or
+  // confirmation timed out); a fresh login would only open a gap in pushes
+  private reconnectIfClosed(error: unknown): PendingReconnect {
+    if (this.dependencies.isSocketOpen()) {
+      return { outcome: 'not-needed', done: Promise.resolve(false) };
+    }
+    const reason = `power command failed for ${this.dependencies.deviceName}: ${
+      error instanceof Error ? error.message : String(error)
+    }`;
+    const request: ReconnectRequest = this.dependencies.requestReconnect(reason);
+    const outcome: ReconnectOutcome = request.started
+      ? 'started'
+      : request.reconnecting
+        ? 'joined'
+        : 'rate-limited';
+    return { outcome, done: request.done };
+  }
+
+  private async recover(reconnect: PendingReconnect, failedRequest: boolean): Promise<void> {
     const { deviceName, log } = this.dependencies;
     try {
       const reconnected = await reconnect.done;
-      if (!reconnected && !this.dependencies.isSocketOpen()) {
+      if (!this.dependencies.isSocketOpen()) {
         log.warn(
           'Skipping power resend: no open Dreo socket after recovery. Device: %s, Requested: %s',
           deviceName,
@@ -117,8 +140,12 @@ export class PowerRecovery {
         );
         return;
       }
-      const target = this.dependencies.latestRequested();
+      let target = this.dependencies.latestRequested();
       await this.dependencies.resend(target);
+      for (let resends = 1; resends < MAX_RESENDS && this.dependencies.latestRequested() !== target; resends += 1) {
+        target = this.dependencies.latestRequested();
+        await this.dependencies.resend(target);
+      }
       log.info(
         'Recovered power command after failure. Device: %s, Confirmed: %s, Reconnected: %s',
         deviceName,
