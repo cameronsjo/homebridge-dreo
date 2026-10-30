@@ -123,11 +123,19 @@ Provide your Dreo app login credentials
     },
     "hideTemperatureSensor": false,
     "temperatureOffset": 0,
+    "pollIntervalSeconds": 60,
     "name": "Dreo Platform",
     "platform": "DreoPlatform"
   }
 ]
 ```
+
+| Option | Default | Description |
+|--------|--------:|-------------|
+| `hideTemperatureSensor` | `false` | Hide the fan's temperature sensor. |
+| `temperatureOffset` | `0` | Added to the fan's temperature reading (negative to subtract). |
+| `pollIntervalSeconds` | `60` | How often each fan re-reads power and speed from the Dreo API, so HomeKit catches a change the WebSocket missed. Minimum 30. Polls back off up to 10 minutes while the API is failing. |
+| `debugHoldSocketClosed` | `false` | Debug only, not in the UI form: never open the WebSocket, so state reaches HomeKit through the poll alone. |
 
 ## Contributing
 

@@ -49,6 +49,13 @@
         },
         "default": 0,
         "description": "Subtract (or add) a set amount from the temperature reading (use negative numbers to subtract). This setting only applies to fans."
+      },
+      "pollIntervalSeconds": {
+        "title": "Fan State Poll Interval (seconds)",
+        "type": "integer",
+        "default": 60,
+        "minimum": 30,
+        "description": "How often each fan re-reads its power and speed from the Dreo API, so HomeKit catches a state change the WebSocket missed. Minimum 30."
       }
     }
   },
@@ -67,6 +74,13 @@
       "items": [
         "hideTemperatureSensor",
         "temperatureOffset"
+      ]
+    },
+    {
+      "type": "fieldset",
+      "title": "Reliability",
+      "items": [
+        "pollIntervalSeconds"
       ]
     }
   ]
