@@ -152,7 +152,7 @@ describe('power command recovery', () => {
       throw new Error(NOT_OPEN);
     });
 
-    const attempt = recovery.run(true, 'poweron', () =>
+    const attempt = recovery.run({ kind: 'power', requested: true, observedKey: 'poweron' }, () =>
       controller.execute({ deviceSn: 'fan-1', command: { poweron: true }, expectedState: { poweron: true } }),
     );
 
@@ -171,7 +171,7 @@ describe('power command recovery', () => {
     const controller = controllerWith(() => 'cmd-1', { poweron: { state: false } });
 
     await expect(
-      recovery.run(true, 'poweron', () =>
+      recovery.run({ kind: 'power', requested: true, observedKey: 'poweron' }, () =>
         controller.execute({ deviceSn: 'fan-1', command: { poweron: true }, expectedState: { poweron: true } }),
       ),
     ).rejects.toThrow('Requested: true, Observed: false');
@@ -182,7 +182,7 @@ describe('power command recovery', () => {
     const { recovery, resend } = makeRecovery({ reconnected: true, socketOpen: false, latest: false });
 
     await expect(
-      recovery.run(true, 'poweron', async () => {
+      recovery.run({ kind: 'power', requested: true, observedKey: 'poweron' }, async () => {
         throw new Error(NOT_OPEN);
       }),
     ).rejects.toThrow();
@@ -195,7 +195,7 @@ describe('power command recovery', () => {
     const { recovery, resend, reconcile, log } = makeRecovery({ reconnected: false, socketOpen: false });
 
     await expect(
-      recovery.run(false, 'poweron', async () => {
+      recovery.run({ kind: 'power', requested: false, observedKey: 'poweron' }, async () => {
         throw new Error(NOT_OPEN);
       }),
     ).rejects.toThrow();
@@ -212,8 +212,8 @@ describe('power command recovery', () => {
       throw new Error(NOT_OPEN);
     };
 
-    const first = recovery.run(true, 'poweron', fail);
-    const second = recovery.run(true, 'poweron', fail);
+    const first = recovery.run({ kind: 'power', requested: true, observedKey: 'poweron' }, fail);
+    const second = recovery.run({ kind: 'power', requested: true, observedKey: 'poweron' }, fail);
 
     await expect(first).rejects.toThrow('Reconnect: started');
     await expect(second).rejects.toThrow('Reconnect: recovery-already-running');
@@ -229,7 +229,7 @@ describe('power command recovery', () => {
     const controller = controllerWith(() => 'cmd-1', { poweron: { state: false } });
 
     await expect(
-      recovery.run(true, 'poweron', () =>
+      recovery.run({ kind: 'power', requested: true, observedKey: 'poweron' }, () =>
         controller.execute({ deviceSn: 'fan-1', command: { poweron: true }, expectedState: { poweron: true } }),
       ),
     ).rejects.toThrow('Reconnect: not-needed');
@@ -252,12 +252,57 @@ describe('power command recovery', () => {
     });
 
     await expect(
-      recovery.run(true, 'poweron', async () => {
+      recovery.run({ kind: 'power', requested: true, observedKey: 'poweron' }, async () => {
         throw new Error(NOT_OPEN);
       }),
     ).rejects.toThrow();
     await recovery.settled();
 
     expect(resend.mock.calls).toEqual([[true], [false]]);
+  });
+
+  it('reconciles a failed speed command without resending power or speed', async () => {
+    const { recovery, requestReconnect, resend, reconcile } = makeRecovery({
+      reconnected: true,
+      socketOpen: false,
+    });
+
+    await expect(
+      recovery.run({ kind: 'speed', requested: 4, observedKey: 'windlevel' }, async () => {
+        throw new Error(NOT_OPEN);
+      }),
+    ).rejects.toThrow('Dreo speed command failed. Device: Air Circulator, Requested: 4');
+    await recovery.settled();
+
+    expect(requestReconnect).toHaveBeenCalledTimes(1);
+    expect(resend).not.toHaveBeenCalled();
+    expect(reconcile).toHaveBeenCalledTimes(1);
+  });
+
+  it('warns when the resend limit is reached before the newest request was sent', async () => {
+    let latest = true;
+    const { recovery, resend, log } = makeRecovery({
+      reconnected: true,
+      socketOpen: false,
+      latestRequested: () => latest,
+      resend: async () => {
+        latest = !latest;
+      },
+    });
+
+    await expect(
+      recovery.run({ kind: 'power', requested: true, observedKey: 'poweron' }, async () => {
+        throw new Error(NOT_OPEN);
+      }),
+    ).rejects.toThrow();
+    await recovery.settled();
+
+    expect(resend).toHaveBeenCalledTimes(2);
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining('resend limit reached'),
+      'Air Circulator',
+      false,
+      true,
+    );
   });
 });

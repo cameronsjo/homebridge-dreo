@@ -97,4 +97,16 @@ describe('DreoAPI forced reconnect', () => {
     expect(Date.now() - started).toBeLessThan(1_000);
     expect(openClients()).toBe(0);
   });
+
+  it('abandons a login that finishes after the deadline instead of opening a socket', async () => {
+    api = new LocalDreoAPI(url, 50);
+    const auth = deferred<Authentication>();
+    api.login = () => auth.promise;
+
+    expect(await api.requestReconnect('test late login').done).toBe(false);
+    auth.resolve({ access_token: 'token' });
+    await settle();
+
+    expect(openClients()).toBe(0);
+  });
 });

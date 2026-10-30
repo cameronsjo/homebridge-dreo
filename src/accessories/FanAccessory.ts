@@ -16,6 +16,7 @@ import {
   type DreoState,
 } from '../reliability/ConfirmedController';
 import { PowerRecovery } from '../reliability/PowerRecovery';
+import { forLog } from '../reliability/forLog';
 import { StatePoller, resolvePollIntervalMs } from '../reliability/StatePoller';
 
 type StateSource = 'reconcile' | 'poll';
@@ -25,22 +26,6 @@ type StateSource = 'reconcile' | 'poll';
 // roughly 300-500ms, worst case 1.3s), and debounced so a burst of commands
 // costs one REST call rather than one per command.
 const STATE_RECONCILE_DELAY_MS = 3000;
-
-// Cap for any remote-supplied value that reaches the log. The socket accepts
-// very large frames and every accessory listens on the same one, so an
-// unbounded log of remote content is both a disk-fill risk and, via embedded
-// newlines, a way to forge log lines.
-const MAX_LOGGED_REMOTE_CHARS = 200;
-
-function forLog(value: unknown): string {
-  const text = String(value).slice(0, MAX_LOGGED_REMOTE_CHARS);
-  let sanitized = '';
-  for (const character of text) {
-    const code = character.charCodeAt(0);
-    sanitized += code < 0x20 || code === 0x7f ? ' ' : character;
-  }
-  return sanitized;
-}
 
 /**
  * Platform Accessory
@@ -109,6 +94,8 @@ export class FanAccessory extends BaseAccessory {
       requestReconnect: (reason: string) => this.platform.webHelper.requestReconnect(reason),
       isSocketOpen: (): boolean => this.platform.webHelper.isOpen(),
       resend: async (active: boolean): Promise<void> => {
+        // A resend is a command too: a poll whose read began before it is stale
+        this.commandEpoch += 1;
         await this.controlAndConfirm(
           { [this.currState.powerCMD]: active },
           { [this.currState.powerCMD]: active },
@@ -484,7 +471,13 @@ export class FanAccessory extends BaseAccessory {
     });
 
     this.statePoller.start();
-    this.platform.api.on('shutdown', (): void => this.statePoller.stop());
+    this.platform.api.on('shutdown', (): void => {
+      this.statePoller.stop();
+      if (this.reconcileTimer) {
+        clearTimeout(this.reconcileTimer);
+        this.reconcileTimer = undefined;
+      }
+    });
   }
 
   private communicationFailure(): Error {
@@ -558,7 +551,7 @@ export class FanAccessory extends BaseAccessory {
       active,
     );
     try {
-      await this.powerRecovery.run(active, this.currState.powerCMD, () =>
+      await this.powerRecovery.run({ kind: 'power', requested: active, observedKey: this.currState.powerCMD }, () =>
         this.controlAndConfirm(
           { [this.currState.powerCMD]: active },
           { [this.currState.powerCMD]: active },
@@ -596,7 +589,9 @@ export class FanAccessory extends BaseAccessory {
       converted,
     );
     try {
-      await this.powerRecovery.run(true, this.currState.powerCMD, () => this.setSpeedSequence(converted));
+      await this.powerRecovery.run({ kind: 'speed', requested: converted, observedKey: 'windlevel' }, () =>
+        this.setSpeedSequence(converted),
+      );
     } catch {
       throw this.communicationFailure();
     }

@@ -339,6 +339,11 @@ export default class DreoAPI {
       }
     });
     socket.on('error', (error: Error): void => {
+      // A socket the plugin retired on purpose reports its own termination
+      if (socket !== this.ws) {
+        this.log.debug('Retired WebSocket reported an error. Error: %s', error.message);
+        return;
+      }
       this.log.error('WebSocket error. Server: %s, Error: %s', this.server, error.message);
       emitOptionalError(this.events, error);
     });
@@ -409,6 +414,9 @@ export default class DreoAPI {
       };
       const timeout = setTimeout((): void => {
         this.events.off('open', onOpen);
+        // Abandon the attempt still in flight, so a login that finishes late
+        // cannot open a socket the backoff reconnect then replaces
+        this.connectGeneration += 1;
         resolve(false);
       }, this.forcedReconnectOpenTimeoutMs);
       timeout.unref?.();
@@ -459,6 +467,9 @@ export default class DreoAPI {
     );
     this.reconnectTimer = setTimeout((): void => {
       this.reconnectTimer = undefined;
+      if (this.isOpen()) {
+        return;
+      }
       void this.connectWebSocket(true);
     }, delay);
     this.reconnectTimer.unref?.();
