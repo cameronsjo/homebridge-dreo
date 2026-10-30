@@ -59,7 +59,7 @@ Homebridge pins this plugin to a durable tarball. Deploy with `deploy-dreo.sh` f
 
 ```bash
 npm ci && npm test && npm run build
-npm pack --pack-destination /tmp/dreo-pack
+mkdir -p /tmp/dreo-pack && npm pack --pack-destination /tmp/dreo-pack
 ../scripts/deploy-dreo.sh /tmp/dreo-pack/homebridge-dreo-X.Y.Z.tgz --restart   # restarts Homebridge: every accessory drops for a few seconds
 ../scripts/deploy-dreo.sh --rollback          # prints the newest backup stamp; changes nothing
 ../scripts/deploy-dreo.sh --rollback <stamp> --restart
