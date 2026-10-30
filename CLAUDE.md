@@ -55,13 +55,14 @@ npm test         # vitest
 
 ## Deploy
 
-Homebridge pins this plugin to a durable tarball. Build and pack locally, then overlay the package contents onto the existing module directory and refresh the pinned tarball. Do not run `npm install` during deployment: it can rewrite the wider Homebridge dependency tree.
+Homebridge pins this plugin to a durable tarball. Deploy with `deploy-dreo.sh` from the parent homebridge repo (`../scripts/deploy-dreo.sh`), never `npm install`: it can rewrite the wider Homebridge dependency tree. The script backs up the module dir, pin, and pinned tarball, overlays the package, repins, and verifies version and dist hash. Build from merged `main`.
 
 ```bash
-npm run build
-PKG=$(npm pack --pack-destination .)
-scp "$PKG" pi@192.168.1.222:/tmp/
-ssh pi@192.168.1.222 "rm -rf /tmp/deploy && mkdir /tmp/deploy && tar xzf /tmp/$PKG -C /tmp/deploy && sudo cp -r /tmp/deploy/package/. /var/lib/homebridge/node_modules/homebridge-dreo/ && sudo cp /tmp/$PKG /var/lib/homebridge/tarballs/ && sudo systemctl restart homebridge"
+npm ci && npm test && npm run build
+npm pack --pack-destination /tmp/dreo-pack
+../scripts/deploy-dreo.sh /tmp/dreo-pack/homebridge-dreo-X.Y.Z.tgz --restart   # restarts Homebridge: every accessory drops for a few seconds
+../scripts/deploy-dreo.sh --rollback          # prints the newest backup stamp; changes nothing
+../scripts/deploy-dreo.sh --rollback <stamp> --restart
 ```
 
 ## Syncing with Upstream
