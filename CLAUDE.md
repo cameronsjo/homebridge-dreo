@@ -58,10 +58,11 @@ npm test         # vitest
 Homebridge pins this plugin to a durable tarball. Deploy with `deploy-dreo.sh` from the parent homebridge repo (`../scripts/deploy-dreo.sh`), never `npm install`: it can rewrite the wider Homebridge dependency tree. The script backs up the module dir, pin, and pinned tarball, overlays the package, repins, and verifies version and dist hash. Build from merged `main`.
 
 ```bash
-npm ci && npm test && npm run build
+npm ci && npm run lint && npm test && npm run build
 mkdir -p /tmp/dreo-pack && npm pack --pack-destination /tmp/dreo-pack
 ../scripts/deploy-dreo.sh /tmp/dreo-pack/homebridge-dreo-X.Y.Z.tgz --restart   # restarts Homebridge: every accessory drops for a few seconds
-../scripts/deploy-dreo.sh --rollback          # prints the newest backup stamp; changes nothing
+../scripts/deploy-dreo.sh --status              # version, pin, and backup stamps (YYYYMMDDTHHMMSSZ)
+../scripts/deploy-dreo.sh --rollback            # prints the newest stamp, changes nothing, exits 2
 ../scripts/deploy-dreo.sh --rollback <stamp> --restart
 ```
 
