@@ -15,28 +15,17 @@ import {
   type DreoCommand,
   type DreoState,
 } from '../reliability/ConfirmedController';
+import { PowerRecovery } from '../reliability/PowerRecovery';
+import { forLog } from '../reliability/forLog';
+import { StatePoller, resolvePollIntervalMs } from '../reliability/StatePoller';
+
+type StateSource = 'reconcile' | 'poll';
 
 // How long to let commands settle before re-reading authoritative state. Long
 // enough for the device to actually apply and report a change (observed at
 // roughly 300-500ms, worst case 1.3s), and debounced so a burst of commands
 // costs one REST call rather than one per command.
 const STATE_RECONCILE_DELAY_MS = 3000;
-
-// Cap for any remote-supplied value that reaches the log. The socket accepts
-// very large frames and every accessory listens on the same one, so an
-// unbounded log of remote content is both a disk-fill risk and, via embedded
-// newlines, a way to forge log lines.
-const MAX_LOGGED_REMOTE_CHARS = 200;
-
-function forLog(value: unknown): string {
-  const text = String(value).slice(0, MAX_LOGGED_REMOTE_CHARS);
-  let sanitized = '';
-  for (const character of text) {
-    const code = character.charCodeAt(0);
-    sanitized += code < 0x20 || code === 0x7f ? ' ' : character;
-  }
-  return sanitized;
-}
 
 /**
  * Platform Accessory
@@ -48,6 +37,15 @@ export class FanAccessory extends BaseAccessory {
   private temperatureService?: Service;
   private lightService?: Service;
   private readonly confirmedController: ConfirmedController;
+  private readonly powerRecovery: PowerRecovery;
+  private readonly statePoller: StatePoller<DreoState>;
+
+  // Bumped when a power or speed command starts, so a poll whose read began
+  // before the command can tell it is stale and drop its result
+  private commandEpoch = 0;
+
+  // Newest power state requested from HomeKit; recovery resends this one
+  private lastRequestedActive = false;
 
   // Debounce handle for the post-command reconciliation read
   private reconcileTimer?: NodeJS.Timeout;
@@ -90,6 +88,37 @@ export class FanAccessory extends BaseAccessory {
       confirmationDelayMs: 1500,
     });
 
+    const deviceName: string = accessory.context.device.deviceName;
+    this.powerRecovery = new PowerRecovery({
+      deviceName,
+      requestReconnect: (reason: string) => this.platform.webHelper.requestReconnect(reason),
+      isSocketOpen: (): boolean => this.platform.webHelper.isOpen(),
+      resend: async (active: boolean): Promise<void> => {
+        // A resend is a command too: a poll whose read began before it is stale
+        this.commandEpoch += 1;
+        await this.controlAndConfirm(
+          { [this.currState.powerCMD]: active },
+          { [this.currState.powerCMD]: active },
+        );
+        this.currState.on = active;
+        this.service
+          .getCharacteristic(this.platform.Characteristic.Active)
+          .updateValue(active);
+      },
+      latestRequested: (): boolean => this.lastRequestedActive,
+      reconcile: (): void => this.scheduleStateReconciliation(),
+      log: this.platform.log,
+    });
+    this.statePoller = new StatePoller<DreoState>({
+      deviceName,
+      read: () => this.platform.webHelper.fetchState(this.sn),
+      apply: (polled: DreoState): void => this.applyAuthoritativeState(polled, 'poll'),
+      isBusy: (): boolean => this.confirmedController.isBusy(this.sn),
+      commandEpoch: (): number => this.commandEpoch,
+      intervalMs: resolvePollIntervalMs(this.platform.config.pollIntervalSeconds),
+      log: this.platform.log,
+    });
+
     const capabilities = getFanCapabilities(accessory.context.device, state);
     this.currState.maxSpeed = capabilities.maxSpeed;
     this.currState.powerCMD = capabilities.powerCommand;
@@ -97,6 +126,7 @@ export class FanAccessory extends BaseAccessory {
     this.currState.speed =
       (state.windlevel.state * 100) / this.currState.maxSpeed;
     this.currState.on = Boolean(state[this.currState.powerCMD].state);
+    this.lastRequestedActive = this.currState.on;
 
     // Get the Fanv2 service if it exists, otherwise create a new Fanv2 service
     // You can create multiple services for each accessory
@@ -439,6 +469,21 @@ export class FanAccessory extends BaseAccessory {
       );
       this.scheduleStateReconciliation();
     });
+
+    this.statePoller.start();
+    this.platform.api.on('shutdown', (): void => {
+      this.statePoller.stop();
+      if (this.reconcileTimer) {
+        clearTimeout(this.reconcileTimer);
+        this.reconcileTimer = undefined;
+      }
+    });
+  }
+
+  private communicationFailure(): Error {
+    return new this.platform.api.hap.HapStatusError(
+      this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE,
+    );
   }
 
   private async controlAndConfirm(
@@ -496,13 +541,27 @@ export class FanAccessory extends BaseAccessory {
   }
 
   // Handle requests to set the "Active" characteristic
-  async setActive(value) {
+  async setActive(value: CharacteristicValue) {
     const active = Boolean(value);
-    this.platform.log.debug('Triggered SET Active:', active);
-    await this.controlAndConfirm(
-      { [this.currState.powerCMD]: active },
-      { [this.currState.powerCMD]: active },
+    this.commandEpoch += 1;
+    this.lastRequestedActive = active;
+    this.platform.log.info(
+      'Triggered SET Active. Device: %s, Value: %s',
+      this.accessory.context.device.deviceName,
+      active,
     );
+    try {
+      await this.powerRecovery.run({ kind: 'power', requested: active, observedKey: this.currState.powerCMD }, () =>
+        this.controlAndConfirm(
+          { [this.currState.powerCMD]: active },
+          { [this.currState.powerCMD]: active },
+        ),
+      );
+    } catch {
+      // PowerRecovery logged the failure and started background recovery;
+      // HomeKit shows "No Response" instead of a value the fan never took
+      throw this.communicationFailure();
+    }
     this.currState.on = active;
     this.service
       .getCharacteristic(this.platform.Characteristic.Active)
@@ -515,15 +574,35 @@ export class FanAccessory extends BaseAccessory {
   }
 
   // Handle requests to set the fan speed
-  async setRotationSpeed(value) {
-    const converted = Math.round((value * this.currState.maxSpeed) / 100);
+  async setRotationSpeed(value: CharacteristicValue) {
+    const converted = Math.round((Number(value) * this.currState.maxSpeed) / 100);
     if (converted === 0) {
       await this.setActive(false);
       return;
     }
 
-    this.platform.log.debug('Setting fan speed:', converted);
-    await this.controlAndConfirmSequence(
+    this.commandEpoch += 1;
+    this.lastRequestedActive = true;
+    this.platform.log.info(
+      'Triggered SET RotationSpeed. Device: %s, Level: %s',
+      this.accessory.context.device.deviceName,
+      converted,
+    );
+    try {
+      await this.powerRecovery.run({ kind: 'speed', requested: converted, observedKey: 'windlevel' }, () =>
+        this.setSpeedSequence(converted),
+      );
+    } catch {
+      throw this.communicationFailure();
+    }
+    this.currState.speed = (converted * 100) / this.currState.maxSpeed;
+    this.service
+      .getCharacteristic(this.platform.Characteristic.RotationSpeed)
+      .updateValue(this.currState.speed);
+  }
+
+  private setSpeedSequence(converted: number): Promise<readonly DreoState[]> {
+    return this.controlAndConfirmSequence(
       [
         {
           command: { [this.currState.powerCMD]: true },
@@ -543,10 +622,6 @@ export class FanAccessory extends BaseAccessory {
         }
       },
     );
-    this.currState.speed = (converted * 100) / this.currState.maxSpeed;
-    this.service
-      .getCharacteristic(this.platform.Characteristic.RotationSpeed)
-      .updateValue(this.currState.speed);
   }
 
   // Dreo answers a command with control-reply, which only echoes back the value
@@ -603,18 +678,27 @@ export class FanAccessory extends BaseAccessory {
       return;
     }
 
-    // Power and speed only: these are the values automations act on, and the
-    // ones observed to drift when the device ignores a command
+    this.applyAuthoritativeState(state, 'reconcile');
+  }
+
+  // Power and speed only: these are the values automations act on, and the
+  // ones observed to drift when the device ignores a command
+  private applyAuthoritativeState(state: DreoState, source: StateSource) {
     // Push unconditionally rather than only when our own cache disagrees.
     // HomeKit keeps its own copy of every characteristic, and it can be stale
     // even when ours is correct — in which case an automation whose target
     // state HomeKit believes is already met may never send a command at all.
     // The comparison below gates the log line, not the push.
-    const powerState = state[this.currState.powerCMD]?.state;
+    // Dreo reports power as a boolean on some models and 0/1 on others
+    const rawPower = state[this.currState.powerCMD]?.state;
+    const powerState =
+      typeof rawPower === 'boolean' || typeof rawPower === 'number' ? Boolean(rawPower) : undefined;
     if (powerState !== undefined) {
       if (powerState !== this.currState.on) {
         this.platform.log.info(
-          'Reconciled fan power against the Dreo API. Cached: %s, Actual: %s',
+          'Reconciled fan power against the Dreo API. Device: %s, Source: %s, Cached: %s, Actual: %s',
+          this.accessory.context.device.deviceName,
+          source,
           this.currState.on,
           powerState,
         );
@@ -626,11 +710,13 @@ export class FanAccessory extends BaseAccessory {
     }
 
     const windlevel = state.windlevel?.state;
-    if (windlevel !== undefined) {
+    if (typeof windlevel === 'number') {
       const speed = (windlevel * 100) / this.currState.maxSpeed;
       if (speed !== this.currState.speed) {
         this.platform.log.info(
-          'Reconciled fan speed against the Dreo API. Cached: %s, Actual: %s',
+          'Reconciled fan speed against the Dreo API. Device: %s, Source: %s, Cached: %s, Actual: %s',
+          this.accessory.context.device.deviceName,
+          source,
           this.currState.speed,
           speed,
         );

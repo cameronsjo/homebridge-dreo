@@ -18,17 +18,25 @@ src/
 ├── index.ts              # Plugin registration
 ├── platform.ts           # Platform plugin — device discovery and accessory creation
 ├── settings.ts           # Constants (plugin name, platform name)
-├── DreoAPI.ts            # REST + WebSocket client (auth, commands, state)
-└── accessories/
-    ├── BaseAccessory.ts   # Shared accessory logic
-    ├── FanAccessory.ts    # Tower fans, air circulators, ceiling fans
-    ├── HeaterAccessory.ts # Space heaters
-    └── HumidifierAccessory.ts  # Humidifiers (newest, best-written)
+├── DreoAPI.ts            # REST + WebSocket client (auth, commands, state, forced reconnect)
+├── accessories/
+│   ├── BaseAccessory.ts   # Shared accessory logic
+│   ├── FanAccessory.ts    # Tower fans, air circulators, ceiling fans
+│   ├── HeaterAccessory.ts # Space heaters
+│   └── HumidifierAccessory.ts  # Humidifiers (newest, best-written)
+└── reliability/
+    ├── ConfirmedController.ts  # Per-device command queue; send, then confirm via REST
+    ├── SocketHeartbeat.ts      # '2' keepalive + protocol-ping liveness (3 missed pongs → terminate)
+    ├── ReconnectGate.ts        # Single-flight forced reconnect, at most one per 5 min
+    ├── StatePoller.ts          # Periodic REST re-read with epoch race guard and backoff
+    └── PowerRecovery.ts        # Background recovery after a failed power/speed command
 ```
+
+Dreo's server answers WebSocket protocol pings but never the `'2'` keepalive; `scripts/probe-ws-ping.cjs` re-checks that from the Homebridge host.
 
 ## Fork Priorities
 
-Done: `reconnecting-websocket` replaced with `ws` plus backoff reconnect, token refresh on reconnect, per-device discovery isolation, guarded `JSON.parse` in every message handler, SIGTERM shutdown, `npm audit` clean.
+Done: `reconnecting-websocket` replaced with `ws` plus backoff reconnect, token refresh on reconnect, per-device discovery isolation, guarded `JSON.parse` in every message handler, SIGTERM shutdown, `npm audit` clean, protocol-ping heartbeat, periodic state poll, background command recovery (4.3.0).
 
 | Priority | Open item | File |
 |----------|-----------|------|

@@ -5,12 +5,19 @@ import WebSocket, { type RawData } from 'ws';
 import type { Logger } from 'homebridge';
 import type { DreoPlatform } from './platform';
 import type { DreoCommand } from './reliability/ConfirmedController';
+import { ReconnectGate, type ReconnectRequest } from './reliability/ReconnectGate';
+import { SocketHeartbeat } from './reliability/SocketHeartbeat';
 
 const USER_AGENT = 'dreo/2.8.1 (iPhone; iOS 18.0.0; Scale/3.00)';
-const HEARTBEAT_INTERVAL_MS = 15_000;
 const WEBSOCKET_HANDSHAKE_TIMEOUT_MS = 10_000;
 const MIN_RECONNECT_DELAY_MS = 1_000;
 const MAX_RECONNECT_DELAY_MS = 30_000;
+const FORCED_RECONNECT_OPEN_TIMEOUT_MS = 20_000;
+const HTTP_TIMEOUT_MS = 15_000;
+// A socket must stay open this long before it resets reconnect backoff, so a
+// server that accepts and then drops connections cannot pin backoff at 1 s
+const HEALTHY_SOCKET_MIN_OPEN_MS = 2 * 60_000;
+const RECONNECT_COUNTS_LOG_INTERVAL_MS = 60 * 60_000;
 
 function describeApiError(error: unknown): string {
   const candidate = error as { message?: unknown; response?: { status?: unknown } };
@@ -53,19 +60,29 @@ export default class DreoAPI {
   private readonly events = new EventEmitter();
   private accessToken = '';
   private ws?: WebSocket;
-  private heartbeatTimer?: NodeJS.Timeout;
+  private heartbeat?: SocketHeartbeat;
   private reconnectTimer?: NodeJS.Timeout;
   private reconnectAttempt = 0;
   private commandSequence = 0;
   private authenticationRefresh?: Promise<boolean>;
-  private heartbeatAcknowledged = true;
   private stopped = false;
+  private readonly holdSocketClosed: boolean;
+  private readonly reconnectGate = new ReconnectGate((): Promise<boolean> => this.reconnectNow());
+  private reconnectCountsTimer?: NodeJS.Timeout;
+  // Bumped by every connect attempt; an attempt that resumes after a newer one
+  // started (both waiting on the same auth refresh) abandons itself
+  private connectGeneration = 0;
+  private socketOpenedAt = 0;
+  protected forcedReconnectOpenTimeoutMs = FORCED_RECONNECT_OPEN_TIMEOUT_MS;
   public server = 'us';
 
   constructor(platform: DreoPlatform) {
     this.log = platform.log;
     this.email = platform.config.options?.email;
     this.password = platform.config.options?.password;
+    // Debug only: never open the socket, so state reaches HomeKit through the
+    // REST poll alone. Used to prove the poll covers a missed push.
+    this.holdSocketClosed = platform.config.debugHoldSocketClosed === true;
     process.once('SIGTERM', (): void => this.stopWebSocket());
   }
 
@@ -85,6 +102,7 @@ export default class DreoAPI {
         },
         {
           params: { timestamp: Date.now() },
+          timeout: HTTP_TIMEOUT_MS,
           headers: {
             ua: USER_AGENT,
             lang: 'en',
@@ -111,7 +129,7 @@ export default class DreoAPI {
     try {
       const response = await axios.get(
         `https://app-api-${this.server}.dreo-tech.com/api/app/index/family/room/devices`,
-        { params: { timestamp: Date.now() }, headers: this.authorizedHeaders() },
+        { params: { timestamp: Date.now() }, timeout: HTTP_TIMEOUT_MS, headers: this.authorizedHeaders() },
       );
       return response.data.data.list;
     } catch (error) {
@@ -122,27 +140,66 @@ export default class DreoAPI {
 
   public async getState(sn: string) {
     try {
-      return await this.requestState(sn);
+      return await this.fetchState(sn);
     } catch (error) {
-      let finalError = error;
-      if (getHttpStatus(error) === 401) {
-        this.log.warn('Dreo state request was unauthorized; refreshing authentication once.');
-        const refreshed = await this.refreshAuthentication();
-        if (refreshed) {
-          try {
-            return await this.requestState(sn);
-          } catch (retryError) {
-            finalError = retryError;
-          }
-        }
-      }
-      this.log.error('Error retrieving Dreo device state. Error: %s', describeApiError(finalError));
+      this.log.error('Error retrieving Dreo device state. Error: %s', describeApiError(error));
       return undefined;
     }
   }
 
+  /**
+   * Read device state, refreshing authentication once on a 401. Throws instead
+   * of logging, so a caller with its own backoff (the state poll) decides how
+   * loudly a failure is reported.
+   */
+  // Return type stays inferred from requestState until the P2 noImplicitAny pass types the API payloads
+  public async fetchState(sn: string) {
+    try {
+      return await this.requestState(sn);
+    } catch (error) {
+      if (getHttpStatus(error) !== 401) {
+        throw new Error(describeApiError(error));
+      }
+      this.log.warn('Dreo state request was unauthorized; refreshing authentication once.');
+      const refreshed = await this.refreshAuthentication();
+      if (!refreshed) {
+        throw new Error(`${describeApiError(error)}; authentication refresh failed`);
+      }
+      try {
+        return await this.requestState(sn);
+      } catch (retryError) {
+        throw new Error(describeApiError(retryError));
+      }
+    }
+  }
+
   public async startWebSocket(): Promise<void> {
+    if (!this.reconnectCountsTimer) {
+      this.reconnectCountsTimer = setInterval(
+        (): void => this.logReconnectCounts(),
+        RECONNECT_COUNTS_LOG_INTERVAL_MS,
+      );
+      this.reconnectCountsTimer.unref?.();
+    }
     await this.connectWebSocket(false);
+  }
+
+  public isOpen(): boolean {
+    return this.ws?.readyState === WebSocket.OPEN;
+  }
+
+  /**
+   * Ask for a fresh-auth reconnect. Single-flight across every device, and at
+   * most one new reconnect per window; see ReconnectGate.
+   */
+  public requestReconnect(reason: string): ReconnectRequest {
+    const request = this.reconnectGate.request();
+    this.log.info(
+      'Forced Dreo WebSocket reconnect requested. Reason: %s, Outcome: %s',
+      reason,
+      request.started ? 'started' : request.reconnecting ? 'joined' : 'rate-limited',
+    );
+    return request;
   }
 
   public addEventListener(event: 'open' | 'close' | 'error' | 'message', listener): void {
@@ -175,6 +232,10 @@ export default class DreoAPI {
   public stopWebSocket(): void {
     this.stopped = true;
     this.clearHeartbeat();
+    if (this.reconnectCountsTimer) {
+      clearInterval(this.reconnectCountsTimer);
+      this.reconnectCountsTimer = undefined;
+    }
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = undefined;
@@ -188,6 +249,7 @@ export default class DreoAPI {
       `https://app-api-${this.server}.dreo-tech.com/api/user-device/device/state`,
       {
         params: { deviceSn: sn, timestamp: Date.now() },
+        timeout: HTTP_TIMEOUT_MS,
         headers: this.authorizedHeaders(),
       },
     );
@@ -215,10 +277,20 @@ export default class DreoAPI {
     };
   }
 
+  protected websocketUrl(): string {
+    const query = new URLSearchParams({
+      accessToken: this.accessToken,
+      timestamp: String(Date.now()),
+    });
+    return `wss://wsb-${this.server}.dreo-tech.com/websocket?${query.toString()}`;
+  }
+
   private async connectWebSocket(refreshAuthentication: boolean): Promise<void> {
     if (this.stopped) {
       return;
     }
+    this.connectGeneration += 1;
+    const generation = this.connectGeneration;
     if (refreshAuthentication) {
       const authenticated = await this.refreshAuthentication();
       if (!authenticated) {
@@ -227,16 +299,18 @@ export default class DreoAPI {
         return;
       }
     }
-    if (this.stopped) {
+    if (this.stopped || generation !== this.connectGeneration) {
+      return;
+    }
+    if (this.holdSocketClosed) {
+      this.log.warn('debugHoldSocketClosed is set; not opening the Dreo WebSocket.');
       return;
     }
 
-    const query = new URLSearchParams({
-      accessToken: this.accessToken,
-      timestamp: String(Date.now()),
-    });
-    const url = `wss://wsb-${this.server}.dreo-tech.com/websocket?${query.toString()}`;
-    const socket = new WebSocket(url, {
+    // Never leave a superseded socket running: its handlers ignore it once it
+    // is no longer current, so nothing else would ever close it
+    this.retireCurrentSocket();
+    const socket = new WebSocket(this.websocketUrl(), {
       handshakeTimeout: WEBSOCKET_HANDSHAKE_TIMEOUT_MS,
     });
     this.ws = socket;
@@ -245,7 +319,7 @@ export default class DreoAPI {
       if (socket !== this.ws) {
         return;
       }
-      this.heartbeatAcknowledged = true;
+      this.socketOpenedAt = Date.now();
       this.log.info('WebSocket connection opened. Server: %s', this.server);
       this.startHeartbeat(socket);
       this.events.emit('open');
@@ -253,14 +327,23 @@ export default class DreoAPI {
     socket.on('message', (data: RawData): void => {
       if (socket === this.ws) {
         const message = data.toString();
-        this.heartbeatAcknowledged = true;
         if (isConnectionHealthyMessage(message)) {
-          this.reconnectAttempt = 0;
+          this.markSocketHealthy();
         }
         this.events.emit('message', { data: message });
       }
     });
+    socket.on('pong', (): void => {
+      if (socket === this.ws) {
+        this.markSocketHealthy();
+      }
+    });
     socket.on('error', (error: Error): void => {
+      // A socket the plugin retired on purpose reports its own termination
+      if (socket !== this.ws) {
+        this.log.debug('Retired WebSocket reported an error. Error: %s', error.message);
+        return;
+      }
       this.log.error('WebSocket error. Server: %s, Error: %s', this.server, error.message);
       emitOptionalError(this.events, error);
     });
@@ -282,26 +365,93 @@ export default class DreoAPI {
 
   private startHeartbeat(socket: WebSocket): void {
     this.clearHeartbeat();
-    this.heartbeatTimer = setInterval((): void => {
-      if (socket !== this.ws || socket.readyState !== WebSocket.OPEN) {
-        return;
-      }
-      if (!this.heartbeatAcknowledged) {
-        this.log.warn('Dreo WebSocket heartbeat timed out; terminating stale connection.');
-        socket.terminate();
-        return;
-      }
-      this.heartbeatAcknowledged = false;
-      socket.send('2');
-    }, HEARTBEAT_INTERVAL_MS);
-    this.heartbeatTimer.unref?.();
+    this.heartbeat = new SocketHeartbeat(socket, (unansweredPings: number): void => {
+      this.log.warn(
+        'Dreo WebSocket heartbeat timed out; terminating stale connection. UnansweredPings: %s',
+        unansweredPings,
+      );
+    });
+    this.heartbeat.start();
   }
 
   private clearHeartbeat(): void {
-    if (this.heartbeatTimer) {
-      clearInterval(this.heartbeatTimer);
-      this.heartbeatTimer = undefined;
+    this.heartbeat?.stop();
+    this.heartbeat = undefined;
+  }
+
+  private markSocketHealthy(): void {
+    if (Date.now() - this.socketOpenedAt >= HEALTHY_SOCKET_MIN_OPEN_MS) {
+      this.reconnectAttempt = 0;
     }
+  }
+
+  private retireCurrentSocket(): void {
+    const previous = this.ws;
+    this.ws = undefined;
+    this.clearHeartbeat();
+    // Its close handler sees a socket that is no longer current and schedules
+    // no reconnect of its own
+    previous?.terminate();
+  }
+
+  // Drop the current socket and open a fresh-auth one now, skipping any
+  // pending backoff. Resolves true once the new socket is open, false when the
+  // deadline (which covers the login too) passes first.
+  private async reconnectNow(): Promise<boolean> {
+    if (this.stopped || this.holdSocketClosed) {
+      return false;
+    }
+    this.retireCurrentSocket();
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = undefined;
+    }
+
+    const opened = new Promise<boolean>((resolve: (opened: boolean) => void): void => {
+      const onOpen = (): void => {
+        clearTimeout(timeout);
+        resolve(true);
+      };
+      const timeout = setTimeout((): void => {
+        this.events.off('open', onOpen);
+        // Abandon the attempt still in flight, so a login that finishes late
+        // cannot open a socket the backoff reconnect then replaces
+        this.connectGeneration += 1;
+        resolve(false);
+      }, this.forcedReconnectOpenTimeoutMs);
+      timeout.unref?.();
+      this.events.once('open', onOpen);
+    });
+    this.connectWebSocket(true).catch((error: unknown): void => {
+      this.log.error(
+        'Forced Dreo WebSocket reconnect failed to start. Error: %s',
+        error instanceof Error ? error.message : String(error),
+      );
+    });
+    const result = await opened;
+    if (!result) {
+      this.log.warn(
+        'Forced Dreo WebSocket reconnect did not open within %s ms; normal backoff continues.',
+        this.forcedReconnectOpenTimeoutMs,
+      );
+      if (!this.ws) {
+        this.scheduleReconnect();
+      }
+    }
+    return result;
+  }
+
+  private logReconnectCounts(): void {
+    const counts = this.reconnectGate.drainCounts();
+    if (counts.started + counts.joined + counts.rateLimited === 0) {
+      return;
+    }
+    this.log.info(
+      'Forced Dreo WebSocket reconnects in the last hour. Started: %s, Joined: %s, RateLimited: %s',
+      counts.started,
+      counts.joined,
+      counts.rateLimited,
+    );
   }
 
   private scheduleReconnect(): void {
@@ -317,6 +467,9 @@ export default class DreoAPI {
     );
     this.reconnectTimer = setTimeout((): void => {
       this.reconnectTimer = undefined;
+      if (this.isOpen()) {
+        return;
+      }
       void this.connectWebSocket(true);
     }, delay);
     this.reconnectTimer.unref?.();

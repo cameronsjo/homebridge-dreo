@@ -123,11 +123,25 @@ Provide your Dreo app login credentials
     },
     "hideTemperatureSensor": false,
     "temperatureOffset": 0,
+    "pollIntervalSeconds": 60,
     "name": "Dreo Platform",
     "platform": "DreoPlatform"
   }
 ]
 ```
+
+| Option | Default | Description |
+|--------|--------:|-------------|
+| `hideTemperatureSensor` | `false` | Hide the fan's temperature sensor. |
+| `temperatureOffset` | `0` | Added to the fan's temperature reading (negative to subtract). |
+| `pollIntervalSeconds` | `60` | How often each fan re-reads power and speed from the Dreo API, so HomeKit catches a change the WebSocket missed. Minimum 30. Polls back off up to 10 minutes while the API is failing. |
+| `debugHoldSocketClosed` | `false` | Debug only, not in the UI form: never open the WebSocket, so state reaches HomeKit through the poll alone. |
+
+### Reliability
+
+- A HomeKit on/off that the fan does not confirm within a few seconds shows **No Response** in the Home app. In the background the plugin reconnects the WebSocket if it is down, resends the newest requested power state, and re-reads the fan's state.
+- Every `pollIntervalSeconds`, each fan re-reads power and speed from the Dreo API, so a state change the WebSocket missed (for example, the fan's own button) reaches HomeKit within one interval.
+- Log lines to search for: `Triggered SET Active` (a HomeKit command), `Source: poll` (the poll corrected HomeKit), `Forced Dreo WebSocket reconnect` (recovery reconnected the socket).
 
 ## Contributing
 

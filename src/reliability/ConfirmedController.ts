@@ -27,6 +27,20 @@ export interface ConfirmedControlResult {
 
 export type ConfirmedControlStep = Omit<ConfirmedControlRequest, 'deviceSn'>;
 
+export class ConfirmationError extends Error {
+  constructor(
+    public readonly commandId: string,
+    public readonly expectedState: Readonly<Record<string, unknown>>,
+    public readonly actualState: Readonly<Record<string, unknown>>,
+  ) {
+    super(
+      `Dreo command ${commandId} was not confirmed. ` +
+        `Expected: ${JSON.stringify(expectedState)}, Actual: ${JSON.stringify(actualState)}`,
+    );
+    this.name = 'ConfirmationError';
+  }
+}
+
 export class ConfirmedController {
   private readonly deviceQueues = new Map<string, Promise<void>>();
 
@@ -34,6 +48,15 @@ export class ConfirmedController {
     if (dependencies.attempts < 1) {
       throw new Error('Confirmation attempts must be at least one.');
     }
+  }
+
+  /**
+   * True while a command for this device is queued or awaiting confirmation.
+   * Derived from the queue itself, which clears when the operation settles,
+   * so a command that throws cannot leave it stuck.
+   */
+  public isBusy(deviceSn: string): boolean {
+    return this.deviceQueues.has(deviceSn);
   }
 
   public execute(request: ConfirmedControlRequest): Promise<ConfirmedControlResult> {
@@ -96,10 +119,7 @@ export class ConfirmedController {
     const actualState = Object.fromEntries(
       Object.keys(request.expectedState).map((key: string) => [key, latestState?.[key]?.state]),
     );
-    throw new Error(
-      `Dreo command ${commandId} was not confirmed. ` +
-      `Expected: ${JSON.stringify(request.expectedState)}, Actual: ${JSON.stringify(actualState)}`,
-    );
+    throw new ConfirmationError(commandId, request.expectedState, actualState);
   }
 
   private matchesExpectedState(
